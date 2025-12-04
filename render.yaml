@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: api-smart-store
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+
+      # Conexão com o SaaS Central (Preencher com a URL da api-fluxoclean)
+      - key: SAAS_API_URL
+        value: https://api-fluxoclean.onrender.com/api
+
+      # Integração Gemini AI
+      - key: API_KEY
+        sync: false
+
+      # CORS (Frontends permitidos)
+      - key: FLUXOCLEAN
+        value: https://fluxoclean.com.br
+      - key: SMARTSTORE
+        value: https://smart-store.fluxoclean.com.br
+
+    autoDeploy: false
