@@ -8,20 +8,26 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-
+      - key: ALLOWED_ORIGINS
+        fromConnectionString: https://fluxoclean.com.br,https://www.fluxoclean.com.br,https://smart-store.fluxoclean.com.br,https://app-fluxoclean.pages.dev,https://app-smart-store.pages.dev
+      
+      # --- Variáveis Sensíveis (Preencher Manualmente no Dashboard) ---
       - key: MONGODB_URI
         sync: false
       - key: JWT_SECRET
         sync: false
       - key: API_KEY
         sync: false
-
+      
+      # --- Configurações de Conexão ---
       - key: SAAS_API_URL
         value: https://api-fluxoclean.onrender.com/api
-
+      
+      # --- Configurações de CORS e Domínios ---
+      # Usado para permitir requisições do frontend da loja
       - key: SMARTSTORE
         value: https://smart-store.fluxoclean.com.br
-
+      # Usado para permitir requisições do painel central (redirecionamentos/auth)
       - key: FLUXOCLEAN
         value: https://fluxoclean.com.br
 
