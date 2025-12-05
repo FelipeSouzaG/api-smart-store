@@ -1,3 +1,4 @@
+
 import mongoose from 'mongoose';
 const { Schema } = mongoose;
 
@@ -8,8 +9,9 @@ const CashTransactionSchema = new Schema({
   type: { type: String, required: true },
   category: { type: String, required: true },
   status: { type: String, required: true },
-  timestamp: { type: Date, default: Date.now },
-  dueDate: Date,
+  timestamp: { type: Date, default: Date.now }, // Data de Lançamento / Competência
+  dueDate: Date, // Data de Vencimento
+  paymentDate: Date, // Data da Baixa / Pagamento Real
   serviceOrderId: String,
   purchaseId: String,
   saleId: String,
@@ -26,3 +28,4 @@ CashTransactionSchema.set('toJSON', {
 });
 
 export default mongoose.model('CashTransaction', CashTransactionSchema);
+
