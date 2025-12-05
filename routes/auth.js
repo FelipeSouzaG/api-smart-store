@@ -54,10 +54,11 @@ router.get('/me', protect, async (req, res) => {
     });
 
     // Set HttpOnly Cookie
+    // In production (Secure), we use SameSite: 'None' to allow cross-site usage (Frontend vs API domains)
     res.cookie('token', sessionToken, {
       httpOnly: true, // Prevent XSS
       secure: process.env.NODE_ENV === 'production', // HTTPS only in prod
-      sameSite: 'lax', // CSRF protection
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax', // CSRF protection strategy
       maxAge: 24 * 60 * 60 * 1000, // 1 day
     });
 
@@ -79,6 +80,8 @@ router.post('/logout', (req, res) => {
   res.cookie('token', '', {
     httpOnly: true,
     expires: new Date(0),
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
   });
   res.status(200).json({ message: 'Logged out' });
 });
