@@ -1,3 +1,4 @@
+
 import express from 'express';
 import User from '../models/User.js';
 import jwt from 'jsonwebtoken';
@@ -6,29 +7,47 @@ import { protect, authorize } from '../middleware/authMiddleware.js';
 const router = express.Router();
 
 // Configuration for SaaS Central API
-const SAAS_API_URL = 'http://localhost:4000/api/auth/sub-users';
+// Ensure no trailing slash for cleaner URL construction
+const SAAS_API_BASE = (process.env.SAAS_API_URL || 'http://localhost:4000/api').replace(/\/$/, '');
+const SAAS_ENDPOINT = `${SAAS_API_BASE}/auth/sub-users`;
 
 // Helper to sync with SaaS
 const syncWithSaaS = async (method, endpoint, body, token) => {
+  const url = `${SAAS_ENDPOINT}${endpoint}`;
   const headers = {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${token}`, // Pass the owner's token to authorize the action in SaaS
   };
 
-  const response = await fetch(`${SAAS_API_URL}${endpoint}`, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  try {
+    const response = await fetch(url, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
 
-  if (!response.ok) {
-    const errorData = await response.json();
-    throw new Error(
-      errorData.message || 'Erro na comunicação com o servidor central (SaaS).'
-    );
+    if (!response.ok) {
+      // Try to parse error details
+      let errorDetails = 'Unknown error';
+      try {
+        const errorData = await response.json();
+        errorDetails = errorData.message || response.statusText;
+      } catch (e) {
+        errorDetails = response.statusText;
+      }
+      
+      throw new Error(
+        `Falha na comunicação com SaaS (${response.status}): ${errorDetails}`
+      );
+    }
+
+    return await response.json();
+  } catch (error) {
+    console.error(`[SaaS Sync Error] ${method} ${url}`);
+    if (error.cause) console.error('Cause:', error.cause);
+    console.error('Message:', error.message);
+    throw error;
   }
-
-  return await response.json();
 };
 
 // @route   POST api/users/setup-owner
@@ -83,7 +102,8 @@ router.post('/setup-owner', async (req, res) => {
 // @access  Private (Owner only)
 router.post('/', protect, authorize('owner'), async (req, res) => {
   const { name, email, password, role } = req.body;
-  const ownerToken = req.headers.authorization.split(' ')[1];
+  // Fallback to cookie token if header missing (though protect middleware ensures auth)
+  let ownerToken = req.headers.authorization ? req.headers.authorization.split(' ')[1] : req.cookies.token;
 
   if (!name || !email || !password || !role) {
     return res
@@ -100,12 +120,21 @@ router.post('/', protect, authorize('owner'), async (req, res) => {
   try {
     // 1. Create in SaaS Backend first (Source of Truth for Login)
     // This returns the generated _id from SaaS DB
-    const saasUser = await syncWithSaaS(
-      'POST',
-      '',
-      { name, email, password, role },
-      ownerToken
-    );
+    let saasUser;
+    try {
+        saasUser = await syncWithSaaS(
+          'POST',
+          '',
+          { name, email, password, role },
+          ownerToken
+        );
+    } catch (syncError) {
+        // If sync fails, we abort the creation to prevent desync state where user exists locally but can't login centrally
+        return res.status(502).json({ 
+            message: `Erro de sincronização com servidor central: ${syncError.message}. Verifique a conexão.`,
+            details: syncError.message 
+        });
+    }
 
     // 2. Create in Local Tenant DB using the SAME _id
     // This ensures relationships (e.g. sales made by user) work across the system
@@ -122,12 +151,12 @@ router.post('/', protect, authorize('owner'), async (req, res) => {
 
     res.status(201).json(user.toJSON());
   } catch (err) {
-    console.error(err.message);
+    console.error("Local Create User Error:", err.message);
     // Handle duplicate email error specifically
-    if (err.message.includes('já cadastrado')) {
-      return res.status(400).json({ message: err.message });
+    if (err.message.includes('já cadastrado') || (err.code === 11000)) {
+      return res.status(400).json({ message: 'Email já cadastrado no sistema local.' });
     }
-    res.status(500).json({ message: 'Erro ao criar usuário: ' + err.message });
+    res.status(500).json({ message: 'Erro interno ao salvar usuário: ' + err.message });
   }
 });
 
@@ -150,7 +179,7 @@ router.get('/', protect, authorize('owner', 'manager'), async (req, res) => {
 // @access  Private (Any authenticated user)
 router.put('/profile', protect, async (req, res) => {
   const { name, email, password } = req.body;
-  const token = req.headers.authorization.split(' ')[1];
+  const token = req.headers.authorization ? req.headers.authorization.split(' ')[1] : req.cookies.token;
 
   try {
     // 1. Sync with SaaS (Primary Auth Source)
@@ -202,7 +231,7 @@ router.put('/profile', protect, async (req, res) => {
 // @access  Private (Owner)
 router.put('/:id', protect, authorize('owner'), async (req, res) => {
   const { name, email, password, role } = req.body;
-  const ownerToken = req.headers.authorization.split(' ')[1];
+  const ownerToken = req.headers.authorization ? req.headers.authorization.split(' ')[1] : req.cookies.token;
 
   if (!name || !email || !role) {
     return res
@@ -227,7 +256,12 @@ router.put('/:id', protect, authorize('owner'), async (req, res) => {
     // 1. Sync with SaaS
     const saasPayload = { name, email, role };
     if (password) saasPayload.password = password;
-    await syncWithSaaS('PUT', `/${req.params.id}`, saasPayload, ownerToken);
+    
+    try {
+        await syncWithSaaS('PUT', `/${req.params.id}`, saasPayload, ownerToken);
+    } catch(syncErr) {
+        return res.status(502).json({ message: 'Falha ao atualizar no servidor central. Tente novamente.' });
+    }
 
     // 2. Update Local
     user.name = name;
@@ -248,7 +282,7 @@ router.put('/:id', protect, authorize('owner'), async (req, res) => {
 // @desc    Delete a user
 // @access  Private (Owner)
 router.delete('/:id', protect, authorize('owner'), async (req, res) => {
-  const ownerToken = req.headers.authorization.split(' ')[1];
+  const ownerToken = req.headers.authorization ? req.headers.authorization.split(' ')[1] : req.cookies.token;
   try {
     const userToDelete = await User.findOne({
       _id: req.params.id,
@@ -262,7 +296,11 @@ router.delete('/:id', protect, authorize('owner'), async (req, res) => {
         .json({ message: 'O usuário "owner" não pode ser excluído.' });
 
     // 1. Sync with SaaS (Delete central access)
-    await syncWithSaaS('DELETE', `/${req.params.id}`, null, ownerToken);
+    try {
+        await syncWithSaaS('DELETE', `/${req.params.id}`, null, ownerToken);
+    } catch(syncErr) {
+        return res.status(502).json({ message: 'Falha ao excluir no servidor central. Acesso não revogado.' });
+    }
 
     // 2. Delete Local
     await User.findByIdAndDelete(req.params.id);
