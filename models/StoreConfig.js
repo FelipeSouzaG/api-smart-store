@@ -1,3 +1,4 @@
+
 import mongoose from 'mongoose';
 const { Schema } = mongoose;
 
@@ -37,6 +38,7 @@ const StockThresholdsSchema = new Schema(
 const StoreConfigSchema = new Schema(
   {
     tenantId: { type: String, required: true, index: true, unique: true }, // One config per tenant
+    tenantName: { type: String, default: '' }, // Slug
 
     // Flag indicating if the owner has completed the initial setup wizard
     isSetupComplete: { type: Boolean, default: false },
