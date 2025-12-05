@@ -1,3 +1,4 @@
+
 import express from 'express';
 const router = express.Router();
 import StoreConfig from '../models/StoreConfig.js';
@@ -13,6 +14,7 @@ router.get('/', protect, async (req, res) => {
     if (!config) {
       config = new StoreConfig({
         tenantId: req.tenantId,
+        tenantName: req.tenantInfo?.tenantName || '',
         companyInfo: {
           name: req.tenantInfo?.companyName || '',
           cnpjCpf: req.tenantInfo?.document || '',
@@ -31,6 +33,7 @@ router.get('/', protect, async (req, res) => {
 });
 
 // PUT update global settings (Scoped by Tenant)
+// Also used for server-to-server seeding via Owner Token
 router.put('/', protect, authorize('owner', 'manager'), async (req, res) => {
   try {
     let config = await StoreConfig.findOne({ tenantId: req.tenantId });
@@ -39,7 +42,7 @@ router.put('/', protect, authorize('owner', 'manager'), async (req, res) => {
       config = new StoreConfig({ ...req.body, tenantId: req.tenantId });
       await config.save();
     } else {
-      // Security: Prevent tenantId overwrite
+      // Security: Prevent tenantId overwrite, but allow tenantName updates initially
       const { tenantId, ...updates } = req.body;
       Object.assign(config, updates);
       await config.save();
