@@ -1,3 +1,4 @@
+
 import jwt from 'jsonwebtoken';
 import User from '../models/User.js';
 
@@ -49,6 +50,7 @@ export const protect = async (req, res, next) => {
     req.tenantInfo = {
       companyName: decoded.companyName,
       document: decoded.document,
+      tenantName: decoded.tenantName, // Extracted slug
     };
 
     req.user = await User.findOne({
