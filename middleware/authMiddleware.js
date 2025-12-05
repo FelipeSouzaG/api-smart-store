@@ -17,6 +17,7 @@ export const protect = async (req, res, next) => {
   const isBearerAuth =
     req.headers.authorization && req.headers.authorization.startsWith('Bearer');
 
+  // Skip CSRF check if using Bearer token (Handshake/Mobile/External calls)
   if (!isBearerAuth && (!csrfHeader || csrfHeader !== 'XMLHttpRequest')) {
     if (req.cookies && req.cookies.token) {
       return res
@@ -26,10 +27,12 @@ export const protect = async (req, res, next) => {
   }
 
   try {
-    if (req.cookies && req.cookies.token) {
-      token = req.cookies.token;
-    } else if (isBearerAuth) {
+    // FIX: Prioritize Bearer Token if present.
+    // This allows the frontend to force a new session (Handshake) even if an old Cookie exists.
+    if (isBearerAuth) {
       token = req.headers.authorization.split(' ')[1];
+    } else if (req.cookies && req.cookies.token) {
+      token = req.cookies.token;
     }
 
     if (!token) {
