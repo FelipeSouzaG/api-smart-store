@@ -1,3 +1,4 @@
+
 import 'dotenv/config';
 import express from 'express';
 import mongoose from 'mongoose';
@@ -19,24 +20,28 @@ import usersRouter from './routes/users.js';
 import customersRouter from './routes/customers.js';
 import suppliersRouter from './routes/suppliers.js';
 import settingsRouter from './routes/settings.js';
+import financialRouter from './routes/financial.js';
 
 // Validação de Variáveis Críticas
-const requiredEnvVars = ['JWT_SECRET', 'MONGODB_URI', 'SAAS_API_URL'];
+const requiredEnvVars = [
+  'JWT_SECRET',
+  'MONGODB_URI',
+  'SAAS_API_URL'
+];
 
 if (process.env.NODE_ENV === 'production') {
-  const missingVars = requiredEnvVars.filter((key) => !process.env[key]);
+  const missingVars = requiredEnvVars.filter(key => !process.env[key]);
   if (missingVars.length > 0) {
-    console.error(
-      'FATAL ERROR: Missing required environment variables:',
-      missingVars.join(', ')
-    );
+    console.error('FATAL ERROR: Missing required environment variables:', missingVars.join(', '));
     process.exit(1);
   }
 }
 
 const app = express();
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT || 4001;
 
+// Configuração para Proxy Reverso (Render, Nginx)
+// Essencial para Rate Limit e Cookies seguros em produção
 app.set('trust proxy', 1);
 
 app.use(helmet());
@@ -44,18 +49,20 @@ app.use(cookieParser());
 
 // CORS Configuration
 const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim())
-  : [process.env.FLUXOCLEAN, process.env.SMARTSTORE].filter(Boolean);
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+  : [
+      process.env.FLUXOCLEAN, 
+      process.env.SMARTSTORE,
+      'http://localhost:3000', 
+      'http://localhost:3001'
+    ].filter(Boolean);
 
 app.use(
   cors({
     origin: function (origin, callback) {
       if (!origin) return callback(null, true);
-
-      if (
-        allowedOrigins.indexOf(origin) !== -1 ||
-        process.env.NODE_ENV !== 'production'
-      ) {
+      
+      if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV !== 'production') {
         return callback(null, true);
       } else {
         console.warn(`BLOCKED CORS: Origin ${origin} is not allowed.`);
@@ -79,7 +86,7 @@ const limiter = rateLimit({
   message: 'Muitas requisições deste IP, tente novamente mais tarde.',
   keyGenerator: (req) => {
     return req.ip || req.headers['x-forwarded-for'] || 'unknown';
-  },
+  }
 });
 app.use('/api', limiter);
 
@@ -110,6 +117,7 @@ app.use('/api/insights', insightsRouter);
 app.use('/api/customers', customersRouter);
 app.use('/api/suppliers', suppliersRouter);
 app.use('/api/settings', settingsRouter);
+app.use('/api/financial', financialRouter);
 
 app.use((req, res, next) => {
   res.status(404).json({ message: 'Rota não encontrada.' });
