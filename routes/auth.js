@@ -1,3 +1,4 @@
+
 import express from 'express';
 import User from '../models/User.js';
 import { protect } from '../middleware/authMiddleware.js';
@@ -45,6 +46,7 @@ router.get('/me', protect, async (req, res) => {
       // Inherit tenant info if available in request, or load from config
       companyName: req.tenantInfo?.companyName,
       document: req.tenantInfo?.document,
+      tenantName: req.tenantInfo?.tenantName
     };
 
     const sessionToken = jwt.sign(tokenPayload, process.env.JWT_SECRET, {
@@ -59,7 +61,11 @@ router.get('/me', protect, async (req, res) => {
       maxAge: 24 * 60 * 60 * 1000, // 1 day
     });
 
-    res.status(200).json(existingUser);
+    // Return user AND token (for memory storage in frontend to access SaaS API)
+    res.status(200).json({
+        user: existingUser,
+        token: sessionToken 
+    });
   } catch (err) {
     console.error('Auth/Me Error:', err);
     res.status(500).json({ message: 'Server Error' });
