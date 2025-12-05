@@ -35,7 +35,7 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 const app = express();
-const PORT = process.env.PORT || 4001;
+const PORT = process.env.PORT || 10000;
 
 app.set('trust proxy', 1);
 
@@ -44,7 +44,7 @@ app.use(cookieParser());
 
 // CORS Configuration
 const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',')
+  ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim())
   : [process.env.FLUXOCLEAN, process.env.SMARTSTORE].filter(Boolean);
 
 app.use(
@@ -58,6 +58,7 @@ app.use(
       ) {
         return callback(null, true);
       } else {
+        console.warn(`BLOCKED CORS: Origin ${origin} is not allowed.`);
         return callback(new Error('Not allowed by CORS'), false);
       }
     },
