@@ -2,6 +2,7 @@
 import express from 'express';
 const router = express.Router();
 import FinancialAccount from '../models/FinancialAccount.js';
+import CreditCardTransaction from '../models/CreditCardTransaction.js';
 import { protect, authorize } from '../middleware/authMiddleware.js';
 
 // GET all accounts
@@ -14,10 +15,27 @@ router.get('/', protect, authorize('owner', 'manager'), async (req, res) => {
   }
 });
 
+// GET Credit Card Statement Items (Sub-items of an invoice)
+router.get('/statement', protect, authorize('owner', 'manager'), async (req, res) => {
+    const { accountId, methodId } = req.query;
+    if(!accountId || !methodId) return res.status(400).json({message: "IDs required"});
+
+    try {
+        const items = await CreditCardTransaction.find({
+            tenantId: req.tenantId,
+            financialAccountId: accountId,
+            paymentMethodId: methodId
+        }).sort({ dueDate: -1, timestamp: -1 });
+        
+        res.json(items);
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
 // POST new account
 router.post('/', protect, authorize('owner'), async (req, res) => {
   try {
-    // UPDATED: Destructure arrays from body
     const { bankName, receivingRules, paymentMethods } = req.body;
     
     if (!bankName) return res.status(400).json({ message: 'Nome do banco é obrigatório.' });
@@ -25,7 +43,6 @@ router.post('/', protect, authorize('owner'), async (req, res) => {
     const newAccount = new FinancialAccount({
       tenantId: req.tenantId,
       bankName,
-      // UPDATED: Use provided arrays or default to empty
       receivingRules: receivingRules || [],
       paymentMethods: paymentMethods || []
     });
@@ -38,7 +55,7 @@ router.post('/', protect, authorize('owner'), async (req, res) => {
   }
 });
 
-// PUT update account (Add rules/methods)
+// PUT update account
 router.put('/:id', protect, authorize('owner'), async (req, res) => {
   try {
     const { bankName, receivingRules, paymentMethods } = req.body;
@@ -47,8 +64,6 @@ router.put('/:id', protect, authorize('owner'), async (req, res) => {
     if (!account) return res.status(404).json({ message: 'Conta não encontrada.' });
 
     if (bankName) account.bankName = bankName;
-    
-    // UPDATED: Explicitly update arrays if provided
     if (receivingRules !== undefined) account.receivingRules = receivingRules;
     if (paymentMethods !== undefined) account.paymentMethods = paymentMethods;
 
