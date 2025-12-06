@@ -20,6 +20,9 @@ const PaymentDetailsSchema = new Schema({
     paymentDate: Date,
     bank: String,
     installments: [InstallmentSchema],
+    // New Fields for Financial Account Linking
+    financialAccountId: String,
+    paymentMethodId: String
 }, { _id: false });
 
 const SupplierInfoSchema = new Schema({
