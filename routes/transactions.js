@@ -50,27 +50,26 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
         const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
         const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId);
 
-        // --- CREDIT CARD LOGIC ---
-        // If it's a Credit Card, we ignore the passed dueDate/paymentDate and calculate our own based on cycle
+        // --- CREDIT CARD SPLIT LOGIC ---
+        // Generates dynamic costs for each installment based on card cycle
         if (methodRule && methodRule.type === 'Credit') {
-            const numInstallments = installments && installments > 0 ? installments : 1;
+            const numInstallments = installments && installments > 0 ? parseInt(installments) : 1;
             const installmentValue = amount / numInstallments;
             const newTransactions = [];
             
+            // Default config if missing
             const closingDay = methodRule.closingDay || 1;
             const dueDay = methodRule.dueDay || 10;
 
-            // Calculate First Due Date based on Purchase Date vs Closing Date
-            // We must use the day of the purchase to compare against closing day
-            const purchaseDay = competenceDate.getUTCDate(); // Use UTC date to avoid timezone shifts
-            
-            // Start calculation based on purchase month/year
+            // Calculate First Invoice Month based on Purchase Date vs Closing Date
+            const purchaseDay = competenceDate.getUTCDate();
             let targetMonth = competenceDate.getUTCMonth();
             let targetYear = competenceDate.getUTCFullYear();
 
             // If purchase day >= closing day, the bill for this month is closed, so it goes to NEXT month
             if (purchaseDay >= closingDay) {
                 targetMonth += 1;
+                // Handle year rollover immediately for the start month
                 if (targetMonth > 11) {
                     targetMonth = 0;
                     targetYear += 1;
@@ -92,12 +91,17 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
                 // Construct specific Due Date (Noon UTC to be safe)
                 const autoDueDate = new Date(Date.UTC(currentInstYear, currentInstMonth, dueDay, 12, 0, 0));
                 
+                // Format description with installment info and card name
+                const instDesc = numInstallments > 1 
+                    ? `${description} - ${methodRule.name} (${i + 1}/${numInstallments})` 
+                    : `${description} - ${methodRule.name}`;
+
                 newTransactions.push({
                     ...transactionBase,
-                    description: numInstallments > 1 ? `${description} (${i + 1}/${numInstallments})` : description,
+                    description: instDesc,
                     amount: installmentValue,
-                    // FORCE PENDING: Credit card purchases are debts to be paid later (Accounts Payable).
-                    // Even if user clicked "Paid" (meaning "I swiped the card"), the cash hasn't left the bank yet.
+                    // FORCE PENDING: Credit card purchases are accounts payable.
+                    // They stay PENDING until the user manually pays the invoice transaction.
                     status: TransactionStatus.PENDING, 
                     dueDate: autoDueDate,
                     paymentDate: null // No cash outflow yet
@@ -105,19 +109,18 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
             }
 
             const created = await CashTransaction.insertMany(newTransactions);
-            return res.status(201).json(created[0]); 
+            return res.status(201).json(created[0]); // Return first one for frontend feedback
         }
     }
 
     // 2. Default Behavior (Cash Box, Bank-Debit, Bank-Pix, or Pending Bill)
-    // Use the dates provided by the frontend
     const transaction = new CashTransaction({
         ...transactionBase,
         dueDate: dueDate ? new Date(dueDate) : undefined,
         paymentDate: paymentDate ? new Date(paymentDate) : undefined
     });
     
-    // Safety Fallback: If Paid but no paymentDate, default to now (though frontend should block this)
+    // Safety Fallback: If Paid but no paymentDate, default to now
     if (transaction.status === TransactionStatus.PAID && !transaction.paymentDate) {
         transaction.paymentDate = new Date();
     }
