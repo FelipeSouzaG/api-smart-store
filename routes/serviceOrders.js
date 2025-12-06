@@ -207,6 +207,7 @@ router.post(
   authorize('owner', 'manager', 'technician'),
   async (req, res) => {
     const { paymentMethod, discount, finalPrice, costPaymentDetails } = req.body;
+    console.log("DEBUG: [OS ToggleStatus] Body received:", req.body);
 
     try {
       const order = await ServiceOrder.findOne({
@@ -250,9 +251,10 @@ router.post(
 
         // 2. COST TRANSACTION (Despesa) - Only if cost > 0
         const costAmount = Number(order.totalCost);
+        console.log("DEBUG: [OS ToggleStatus] Cost Amount:", costAmount);
         
         if (costAmount > 0 && costPaymentDetails) {
-            
+            console.log("DEBUG: [OS ToggleStatus] Processing Cost Payment...");
             let costStatus = costPaymentDetails.status;
             let financialAccountId = costPaymentDetails.financialAccountId || 'cash-box';
             let paymentMethodId = costPaymentDetails.paymentMethodId;
@@ -264,10 +266,15 @@ router.post(
 
             // Check if it is a Credit Card payment method (Financeiro Table)
             if (financialAccountId !== 'cash-box' && paymentMethodId) {
+                console.log("DEBUG: [OS ToggleStatus] Looking up Account:", financialAccountId);
                 const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
+                console.log("DEBUG: [OS ToggleStatus] Account Found?", !!account);
+                
                 const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId);
+                console.log("DEBUG: [OS ToggleStatus] Method Found?", methodRule);
 
                 if (methodRule && methodRule.type === 'Credit') {
+                    console.log("DEBUG: [OS ToggleStatus] Identified as Credit Card!");
                     isCreditCard = true;
                     numInstallments = costPaymentDetails.installments || 1;
                     
@@ -295,7 +302,7 @@ router.post(
                         // Create UTC Date for consistency (Noon UTC)
                         const autoDueDate = new Date(Date.UTC(currentInstYear, currentInstMonth, dueDay, 12, 0, 0));
                         
-                        transactionsToAdd.push({
+                        const trx = {
                             tenantId: req.tenantId,
                             description: `Custo OS #${order.id} - ${order.serviceDescription} (${i + 1}/${numInstallments})`,
                             amount: installmentValue,
@@ -309,13 +316,16 @@ router.post(
                             serviceOrderId: order.id,
                             financialAccountId,
                             paymentMethodId
-                        });
+                        };
+                        console.log("DEBUG: [OS ToggleStatus] Adding CC Installment:", trx);
+                        transactionsToAdd.push(trx);
                     }
                 }
             }
 
             // Logic B: Normal Payment (Cash/Pix/Debit) OR Manual Pending
             if (!isCreditCard) {
+                console.log("DEBUG: [OS ToggleStatus] Processing as Standard Payment (Not Credit Card)");
                 let costDueDate, costPaymentDate;
 
                 if (costStatus === TransactionStatus.PAID) {
