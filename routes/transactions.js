@@ -36,7 +36,7 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
     amount,
     category,
     type: TransactionType.EXPENSE, // Manual costs are always expense
-    status, // From frontend
+    status, // From frontend (might be overridden for Credit Card)
     tenantId: req.tenantId,
     timestamp: competenceDate,
     financialAccountId: financialAccountId === 'cash-box' ? 'cash-box' : financialAccountId, // Persist 'cash-box' string or ID
@@ -61,28 +61,43 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
             const dueDay = methodRule.dueDay || 10;
 
             // Calculate First Due Date based on Purchase Date vs Closing Date
-            // Use competenceDate (Date of Purchase) to decide the bill month
-            let referenceDate = new Date(competenceDate); 
-            const purchaseDay = referenceDate.getDate();
+            // We must use the day of the purchase to compare against closing day
+            const purchaseDay = competenceDate.getUTCDate(); // Use UTC date to avoid timezone shifts
             
-            // Logic: If purchase day >= closing day, bill goes to next month
+            // Start calculation based on purchase month/year
+            let targetMonth = competenceDate.getUTCMonth();
+            let targetYear = competenceDate.getUTCFullYear();
+
+            // If purchase day >= closing day, the bill for this month is closed, so it goes to NEXT month
             if (purchaseDay >= closingDay) {
-                referenceDate.setMonth(referenceDate.getMonth() + 1);
+                targetMonth += 1;
+                if (targetMonth > 11) {
+                    targetMonth = 0;
+                    targetYear += 1;
+                }
             }
 
             // Generate Installments
             for (let i = 0; i < numInstallments; i++) {
-                let targetMonth = referenceDate.getMonth() + i; 
-                let targetYear = referenceDate.getFullYear();
+                // Calculate current installment month/year
+                let currentInstMonth = targetMonth + i;
+                let currentInstYear = targetYear;
                 
-                // Construct specific Due Date
-                const autoDueDate = new Date(targetYear, targetMonth, dueDay, 12, 0, 0);
+                // Adjust for year rollover (e.g. month 13 becomes month 1 of next year)
+                while (currentInstMonth > 11) {
+                    currentInstMonth -= 12;
+                    currentInstYear += 1;
+                }
+                
+                // Construct specific Due Date (Noon UTC to be safe)
+                const autoDueDate = new Date(Date.UTC(currentInstYear, currentInstMonth, dueDay, 12, 0, 0));
                 
                 newTransactions.push({
                     ...transactionBase,
                     description: numInstallments > 1 ? `${description} (${i + 1}/${numInstallments})` : description,
                     amount: installmentValue,
-                    // FORCE PENDING: Credit card purchases are debts to be paid later.
+                    // FORCE PENDING: Credit card purchases are debts to be paid later (Accounts Payable).
+                    // Even if user clicked "Paid" (meaning "I swiped the card"), the cash hasn't left the bank yet.
                     status: TransactionStatus.PENDING, 
                     dueDate: autoDueDate,
                     paymentDate: null // No cash outflow yet
