@@ -1,8 +1,10 @@
+
 import express from 'express';
 const router = express.Router();
 import ServiceOrder from '../models/ServiceOrder.js';
 import Customer from '../models/Customer.js';
 import CashTransaction from '../models/CashTransaction.js';
+import FinancialAccount from '../models/FinancialAccount.js';
 import {
   TransactionType,
   TransactionCategory,
@@ -204,7 +206,8 @@ router.post(
   protect,
   authorize('owner', 'manager', 'technician'),
   async (req, res) => {
-    const { paymentMethod, discount, finalPrice } = req.body;
+    // costPaymentDetails: { status: 'PENDING'|'PAID', financialAccountId?, paymentMethodId?, date?, installments? }
+    const { paymentMethod, discount, finalPrice, costPaymentDetails } = req.body;
 
     try {
       const order = await ServiceOrder.findOne({
@@ -215,11 +218,11 @@ router.post(
         return res.status(404).json({ message: 'Service Order not found' });
 
       if (order.status === ServiceOrderStatus.PENDING) {
-        // Completing the order
+        // --- COMPLETING THE ORDER ---
         order.status = ServiceOrderStatus.COMPLETED;
         order.completedAt = new Date();
 
-        // Update financial details if provided
+        // Update financial details (Revenue)
         if (finalPrice !== undefined) order.finalPrice = Number(finalPrice);
         if (discount !== undefined) order.discount = Number(discount);
         if (paymentMethod) order.paymentMethod = paymentMethod;
@@ -229,32 +232,127 @@ router.post(
             ? Number(finalPrice)
             : Number(order.totalPrice);
 
-        // Create Financial Transactions
-        const transactionsToAdd = [
-          {
-            tenantId: req.tenantId,
-            description: `Faturamento OS #${order.id} - ${order.serviceDescription}`,
-            amount: amountToReceive,
-            type: TransactionType.INCOME,
-            category: TransactionCategory.SERVICE_REVENUE,
-            status: TransactionStatus.PAID,
-            timestamp: new Date(),
-            serviceOrderId: order.id,
-          },
-          {
-            tenantId: req.tenantId,
-            description: `Custo OS #${order.id} - ${order.serviceDescription}`,
-            amount: Number(order.totalCost),
-            type: TransactionType.EXPENSE,
-            category: TransactionCategory.SERVICE_COST,
-            status: TransactionStatus.PENDING,
-            timestamp: new Date(),
-            serviceOrderId: order.id,
-          },
-        ];
+        const transactionsToAdd = [];
+
+        // 1. REVENUE TRANSACTION (Always Paid/Cash for OS in this simplified flow, or mapped to cash-box)
+        transactionsToAdd.push({
+          tenantId: req.tenantId,
+          description: `Faturamento OS #${order.id} - ${order.serviceDescription}`,
+          amount: amountToReceive,
+          type: TransactionType.INCOME,
+          category: TransactionCategory.SERVICE_REVENUE,
+          status: TransactionStatus.PAID,
+          timestamp: new Date(),
+          dueDate: new Date(),
+          paymentDate: new Date(),
+          serviceOrderId: order.id,
+          financialAccountId: 'cash-box' // Default revenue to cash box for OS simple flow
+        });
+
+        // 2. COST TRANSACTION (Only if totalCost > 0)
+        const costAmount = Number(order.totalCost);
+        if (costAmount > 0) {
+            
+            // Default fallback if no details provided
+            let costStatus = TransactionStatus.PENDING;
+            let costDueDate = new Date();
+            let costPaymentDate = null;
+            let financialAccountId = 'cash-box';
+            let paymentMethodId = undefined;
+
+            if (costPaymentDetails) {
+                costStatus = costPaymentDetails.status;
+                const inputDate = costPaymentDetails.date ? new Date(costPaymentDetails.date) : new Date();
+                
+                if (costPaymentDetails.financialAccountId) {
+                    financialAccountId = costPaymentDetails.financialAccountId;
+                }
+                
+                // Logic A: Credit Card Split (Dynamic Invoice)
+                if (financialAccountId !== 'cash-box' && costPaymentDetails.paymentMethodId) {
+                    paymentMethodId = costPaymentDetails.paymentMethodId;
+                    
+                    const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
+                    const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId);
+
+                    if (methodRule && methodRule.type === 'Credit') {
+                        // --- CREDIT CARD LOGIC ---
+                        const numInstallments = costPaymentDetails.installments || 1;
+                        const installmentValue = costAmount / numInstallments;
+                        
+                        // Card Cycle Logic
+                        const closingDay = methodRule.closingDay || 1;
+                        const dueDay = methodRule.dueDay || 10;
+                        const pDate = new Date();
+                        const pDay = pDate.getDate();
+                        let targetMonth = pDate.getMonth();
+                        let targetYear = pDate.getFullYear();
+
+                        if (pDay >= closingDay) {
+                            targetMonth += 1;
+                            if (targetMonth > 11) { targetMonth = 0; targetYear += 1; }
+                        }
+
+                        for (let i = 0; i < numInstallments; i++) {
+                            let currentInstMonth = targetMonth + i;
+                            let currentInstYear = targetYear;
+                            while (currentInstMonth > 11) { currentInstMonth -= 12; currentInstYear += 1; }
+                            
+                            const autoDueDate = new Date(Date.UTC(currentInstYear, currentInstMonth, dueDay, 12, 0, 0));
+                            
+                            transactionsToAdd.push({
+                                tenantId: req.tenantId,
+                                description: `Custo OS #${order.id} - ${order.serviceDescription} (${i + 1}/${numInstallments})`,
+                                amount: installmentValue,
+                                type: TransactionType.EXPENSE,
+                                category: TransactionCategory.SERVICE_COST,
+                                status: TransactionStatus.PENDING, // Credit card bills are pending for the owner
+                                timestamp: new Date(),
+                                dueDate: autoDueDate,
+                                serviceOrderId: order.id,
+                                financialAccountId,
+                                paymentMethodId
+                            });
+                        }
+                        // Skip adding the single transaction below
+                        await CashTransaction.insertMany(transactionsToAdd);
+                        const updatedOrder = await order.save();
+                        return res.json(updatedOrder);
+                    }
+                }
+
+                // Logic B: Cash/Pix/Debit or Manual Pending
+                if (costStatus === TransactionStatus.PAID) {
+                    costDueDate = inputDate;
+                    costPaymentDate = inputDate;
+                } else {
+                    // Pending
+                    costDueDate = inputDate;
+                    costPaymentDate = null;
+                }
+            }
+
+            // Add the single transaction (Non-Credit Card)
+            transactionsToAdd.push({
+                tenantId: req.tenantId,
+                description: `Custo OS #${order.id} - ${order.serviceDescription}`,
+                amount: costAmount,
+                type: TransactionType.EXPENSE,
+                category: TransactionCategory.SERVICE_COST,
+                status: costStatus,
+                timestamp: new Date(), // Competence
+                dueDate: costDueDate,
+                paymentDate: costPaymentDate,
+                serviceOrderId: order.id,
+                financialAccountId,
+                paymentMethodId
+            });
+        }
+
         await CashTransaction.insertMany(transactionsToAdd);
+
       } else {
-        // It's COMPLETED, attempt to revert to PENDING
+        // --- REVERTING TO PENDING (Reopening) ---
         // Technicians are not allowed to reopen a completed order.
         if (req.user.role === 'technician') {
           return res
@@ -281,6 +379,7 @@ router.post(
       const updatedOrder = await order.save();
       res.json(updatedOrder);
     } catch (err) {
+      console.error(err);
       res.status(500).json({ message: err.message });
     }
   }
