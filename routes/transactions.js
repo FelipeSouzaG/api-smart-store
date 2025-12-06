@@ -20,7 +20,8 @@ router.get('/', protect, authorize('owner', 'manager'), async (req, res) => {
 
 // POST a new transaction (for manual costs)
 router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
-  const { description, amount, category, paymentMethodId, installments, financialAccountId, timestamp } = req.body;
+  // Extract fields - Note: dueDate/paymentDate might come from frontend for manual entries
+  const { description, amount, category, paymentMethodId, installments, financialAccountId, timestamp, dueDate, paymentDate, status } = req.body;
   
   if (!description || !amount || !category) {
     return res.status(400).json({ message: 'Descrição, valor e categoria são obrigatórios.' });
@@ -31,9 +32,15 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
 
   // Base transaction structure
   const transactionBase = {
-    ...req.body,
+    description,
+    amount,
+    category,
+    type: TransactionType.EXPENSE, // Manual costs are always expense
+    status, // From frontend
     tenantId: req.tenantId,
     timestamp: competenceDate,
+    financialAccountId,
+    paymentMethodId
   };
 
   try {
@@ -43,6 +50,7 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
         const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId);
 
         // --- CREDIT CARD LOGIC ---
+        // If it's a Credit Card, we ignore the passed dueDate/paymentDate and calculate our own based on cycle
         if (methodRule && methodRule.type === 'Credit') {
             const numInstallments = installments && installments > 0 ? installments : 1;
             const installmentValue = amount / numInstallments;
@@ -52,39 +60,29 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
             const dueDay = methodRule.dueDay || 10;
 
             // Calculate First Due Date based on Purchase Date vs Closing Date
-            // Example: Buy 20th. Close 25th. Bill comes THIS month (or next month depending on due day logic).
-            // Standard Logic: If Buy Date < Closing Date, it enters current cycle. If Buy Date >= Closing Date, it enters NEXT cycle.
+            let referenceDate = new Date(competenceDate); 
             
-            let referenceDate = new Date(competenceDate); // Start calculation from purchase date
-            
-            // If purchase is AFTER closing day, bump to next month's bill
+            // If purchase day >= closing day, bill goes to next month
             if (referenceDate.getDate() >= closingDay) {
                 referenceDate.setMonth(referenceDate.getMonth() + 1);
             }
 
             // Generate Installments
             for (let i = 0; i < numInstallments; i++) {
-                // Determine Due Date: The configured Due Day of the reference month
-                // We create a new date object to avoid mutating referenceDate incorrectly in loop
                 let targetMonth = referenceDate.getMonth() + i; 
                 let targetYear = referenceDate.getFullYear();
                 
-                // Adjust year if month overflows (handled by Date constructor usually, but explicit is safer)
-                const dueDate = new Date(targetYear, targetMonth, dueDay, 12, 0, 0);
+                // Construct specific Due Date
+                const autoDueDate = new Date(targetYear, targetMonth, dueDay, 12, 0, 0);
                 
-                // Check for year rollover in case Date constructor behaves oddly with index loop
-                // (Date(2023, 13, 1) becomes Feb 2024 automatically, so standard JS Date is fine)
-
                 newTransactions.push({
                     ...transactionBase,
                     description: numInstallments > 1 ? `${description} (${i + 1}/${numInstallments})` : description,
                     amount: installmentValue,
                     // FORCE PENDING: Credit card purchases are debts to be paid later.
                     status: TransactionStatus.PENDING, 
-                    dueDate: dueDate,
-                    paymentDate: null, // No cash outflow yet
-                    financialAccountId,
-                    paymentMethodId
+                    dueDate: autoDueDate,
+                    paymentDate: null // No cash outflow yet
                 });
             }
 
@@ -93,11 +91,15 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
         }
     }
 
-    // 2. Default Behavior (Cash, Pix, Debit - Immediate or Scheduled)
-    // For Debit/Pix, if status is PAID, paymentDate should be set.
-    const transaction = new CashTransaction(transactionBase);
+    // 2. Default Behavior (Cash, Pix, Debit, or Pending Bill)
+    // Use the dates provided by the frontend
+    const transaction = new CashTransaction({
+        ...transactionBase,
+        dueDate: dueDate ? new Date(dueDate) : undefined,
+        paymentDate: paymentDate ? new Date(paymentDate) : undefined
+    });
     
-    // Sanity check: If Paid but no paymentDate, default to now
+    // Safety Fallback: If Paid but no paymentDate, default to now (though frontend should block this)
     if (transaction.status === TransactionStatus.PAID && !transaction.paymentDate) {
         transaction.paymentDate = new Date();
     }
