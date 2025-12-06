@@ -1,9 +1,11 @@
+
 import express from 'express';
 const router = express.Router();
 import PurchaseOrder from '../models/PurchaseOrder.js';
 import Product from '../models/Product.js';
 import CashTransaction from '../models/CashTransaction.js';
 import Supplier from '../models/Supplier.js';
+import FinancialAccount from '../models/FinancialAccount.js';
 import {
   TransactionType,
   TransactionCategory,
@@ -86,41 +88,134 @@ const reversePurchaseFromProducts = async (purchaseOrder) => {
   }
 };
 
-// Helper function to create cash transactions
-const createTransactionsForPurchase = (purchaseOrder) => {
+// Helper function to create cash transactions (UPDATED FOR FINANCIAL ACCOUNTS)
+const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymentDate, reqDueDate) => {
   const transactionsToAdd = [];
-  const { paymentDetails } = purchaseOrder;
+  const { paymentDetails, tenantId, totalCost, supplierInfo, id } = purchaseOrder;
+  const descriptionBase = `Compra #${id} - ${supplierInfo.name}`;
 
-  switch (paymentDetails.method) {
-    case PaymentMethod.BANK_SLIP:
-      paymentDetails.installments.forEach((inst) => {
-        transactionsToAdd.push({
-          tenantId: purchaseOrder.tenantId,
-          description: `Compra #${purchaseOrder.id} (${inst.installmentNumber}/${paymentDetails.installments.length}) - ${purchaseOrder.supplierInfo.name}`,
-          amount: inst.amount,
-          type: TransactionType.EXPENSE,
-          category: TransactionCategory.PRODUCT_PURCHASE,
-          status: TransactionStatus.PENDING,
-          dueDate: inst.dueDate,
-          timestamp: inst.dueDate,
-          purchaseId: purchaseOrder.id,
-        });
-      });
-      break;
-    default:
+  // 1. Check for Financial Account Linkage
+  if (paymentDetails.financialAccountId && paymentDetails.financialAccountId !== 'cash-box' && paymentDetails.paymentMethodId) {
+      const account = await FinancialAccount.findOne({ _id: paymentDetails.financialAccountId, tenantId });
+      const methodRule = account?.paymentMethods.find(m => m.id === paymentDetails.paymentMethodId);
+
+      // A. CREDIT CARD LOGIC (Split installments)
+      if (methodRule && methodRule.type === 'Credit') {
+          // Determine number of installments from request payload logic passed down, or default to 1
+          // Since PurchaseOrder schema stores installments array for legacy reasons, we might need to rely on the 'installments' count passed in payload or derived.
+          // However, for consistency, we re-calculate based on the new logic if it's credit card.
+          
+          // NOTE: The `purchaseOrder.paymentDetails.installments` array might be empty if coming from new UI structure for Credit Card.
+          // We assume simple division based on total cost if detailed installment array isn't provided.
+          
+          // Try to guess installment count. If it was stored in DB, use length. If not, default to 1.
+          let numInstallments = 1;
+          if (paymentDetails.installments && paymentDetails.installments.length > 0) {
+             numInstallments = paymentDetails.installments.length;
+          } else {
+             // Fallback: This might happen if frontend sent a simple count. 
+             // Ideally we should have passed `installmentsCount` from frontend to backend explicitly.
+             // For now, let's assume 1 if array is empty, which treats it as sight credit.
+             numInstallments = 1; 
+          }
+
+          const installmentValue = totalCost / numInstallments;
+          const closingDay = methodRule.closingDay || 1;
+          const dueDay = methodRule.dueDay || 10;
+          
+          const competenceDate = new Date(purchaseOrder.createdAt);
+          const pDay = competenceDate.getDate();
+          let targetMonth = competenceDate.getMonth();
+          let targetYear = competenceDate.getFullYear();
+
+          if (pDay >= closingDay) {
+              targetMonth += 1;
+              if (targetMonth > 11) { targetMonth = 0; targetYear += 1; }
+          }
+
+          for (let i = 0; i < numInstallments; i++) {
+              let currentInstMonth = targetMonth + i;
+              let currentInstYear = targetYear;
+              while (currentInstMonth > 11) { currentInstMonth -= 12; currentInstYear += 1; }
+              
+              const autoDueDate = new Date(Date.UTC(currentInstYear, currentInstMonth, dueDay, 12, 0, 0));
+              
+              transactionsToAdd.push({
+                  tenantId,
+                  description: `${descriptionBase} (${i + 1}/${numInstallments})`,
+                  amount: installmentValue,
+                  type: TransactionType.EXPENSE,
+                  category: TransactionCategory.PRODUCT_PURCHASE,
+                  status: TransactionStatus.PENDING, // Credit card costs are always pending until invoice payment
+                  dueDate: autoDueDate,
+                  paymentDate: null,
+                  purchaseId: id,
+                  financialAccountId: paymentDetails.financialAccountId,
+                  paymentMethodId: paymentDetails.paymentMethodId
+              });
+          }
+          return transactionsToAdd;
+      }
+  }
+
+  // 2. Default / Legacy / Cash Logic
+  // If we provided explicit status/dates from frontend (new modal), use them.
+  // Otherwise fall back to legacy schema logic.
+  
+  const finalStatus = reqStatus || (paymentDetails.method === PaymentMethod.BANK_SLIP ? TransactionStatus.PENDING : TransactionStatus.PAID);
+  
+  if (paymentDetails.method === PaymentMethod.BANK_SLIP || (finalStatus === TransactionStatus.PENDING && !paymentDetails.paymentDate)) {
+      // Installments Logic (Manual Bank Slip or Manual Pending)
+      if (paymentDetails.installments && paymentDetails.installments.length > 0) {
+          paymentDetails.installments.forEach((inst) => {
+            transactionsToAdd.push({
+              tenantId,
+              description: `${descriptionBase} (${inst.installmentNumber}/${paymentDetails.installments.length})`,
+              amount: inst.amount,
+              type: TransactionType.EXPENSE,
+              category: TransactionCategory.PRODUCT_PURCHASE,
+              status: TransactionStatus.PENDING,
+              dueDate: inst.dueDate,
+              timestamp: inst.dueDate,
+              purchaseId: id,
+              financialAccountId: paymentDetails.financialAccountId,
+              paymentMethodId: paymentDetails.paymentMethodId
+            });
+          });
+      } else {
+          // Single Pending Item
+          transactionsToAdd.push({
+              tenantId,
+              description: descriptionBase,
+              amount: totalCost,
+              type: TransactionType.EXPENSE,
+              category: TransactionCategory.PRODUCT_PURCHASE,
+              status: TransactionStatus.PENDING,
+              dueDate: reqDueDate ? new Date(reqDueDate) : new Date(),
+              timestamp: new Date(),
+              purchaseId: id,
+              financialAccountId: paymentDetails.financialAccountId,
+              paymentMethodId: paymentDetails.paymentMethodId
+          });
+      }
+  } else {
+      // Immediate Payment (Cash, Pix, Debit)
       transactionsToAdd.push({
-        tenantId: purchaseOrder.tenantId,
-        description: `Compra #${purchaseOrder.id} (${paymentDetails.method}) - ${purchaseOrder.supplierInfo.name}`,
-        amount: purchaseOrder.totalCost,
+        tenantId,
+        description: descriptionBase,
+        amount: totalCost,
         type: TransactionType.EXPENSE,
         category: TransactionCategory.PRODUCT_PURCHASE,
         status: TransactionStatus.PAID,
-        timestamp: paymentDetails.paymentDate,
-        dueDate: paymentDetails.paymentDate,
-        purchaseId: purchaseOrder.id,
+        timestamp: reqPaymentDate ? new Date(reqPaymentDate) : (paymentDetails.paymentDate || new Date()),
+        dueDate: reqPaymentDate ? new Date(reqPaymentDate) : (paymentDetails.paymentDate || new Date()),
+        paymentDate: reqPaymentDate ? new Date(reqPaymentDate) : (paymentDetails.paymentDate || new Date()),
+        purchaseId: id,
+        financialAccountId: paymentDetails.financialAccountId || 'cash-box',
+        paymentMethodId: paymentDetails.paymentMethodId
       });
-      break;
   }
+  
   return transactionsToAdd;
 };
 
@@ -138,10 +233,12 @@ router.get('/', protect, authorize('owner', 'manager'), async (req, res) => {
 
 // POST a new purchase order
 router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
-  const { items, supplierInfo, reference } = req.body;
+  const { items, supplierInfo, reference, status, paymentDate, dueDate } = req.body;
+  
   if (!items || items.length === 0 || !supplierInfo || !reference) {
     return res.status(400).json({ message: 'Dados da compra incompletos.' });
   }
+  
   try {
     const count = await PurchaseOrder.countDocuments({
       tenantId: req.tenantId,
@@ -159,7 +256,7 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
     ) {
       const cleanedCnpjCpf = supplierInfo.cnpjCpf.replace(/\D/g, '');
       await Supplier.findOneAndUpdate(
-        { tenantId: req.tenantId, cnpjCpf: cleanedCnpjCpf }, // Find by Tenant AND CNPJ
+        { tenantId: req.tenantId, cnpjCpf: cleanedCnpjCpf },
         {
           tenantId: req.tenantId,
           cnpjCpf: cleanedCnpjCpf,
@@ -174,13 +271,16 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
     const newPurchaseOrder = new PurchaseOrder({
       ...purchaseData,
       _id: newId,
-      tenantId: req.tenantId, // Security: Inject Tenant ID
+      tenantId: req.tenantId,
       supplierInfo,
       createdAt: new Date(),
     });
 
     await applyPurchaseToProducts(newPurchaseOrder);
-    const transactions = createTransactionsForPurchase(newPurchaseOrder);
+    
+    // Pass extra fields from body to transaction helper
+    const transactions = await createTransactionsForPurchase(newPurchaseOrder, status, paymentDate, dueDate);
+    
     if (transactions.length > 0) {
       await CashTransaction.insertMany(transactions);
     }
@@ -196,7 +296,6 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
 // PUT (update) a purchase order
 router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
   try {
-    // Ensure we are only finding purchases for this tenant
     const originalPO = await PurchaseOrder.findOne({
       _id: req.params.id,
       tenantId: req.tenantId,
@@ -212,9 +311,8 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
     });
 
     // Apply new state
-    const { supplierInfo, tenantId, ...purchaseData } = req.body; // Remove tenantId from body to prevent injection
+    const { supplierInfo, tenantId, status, paymentDate, dueDate, ...purchaseData } = req.body; 
 
-    // Supplier Upsert Logic (Scoped by Tenant)
     if (
       supplierInfo &&
       supplierInfo.cnpjCpf &&
@@ -238,14 +336,16 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
     const updatedPOData = {
       supplierInfo,
       ...purchaseData,
-      tenantId: req.tenantId, // Ensure correct tenantId persists
+      tenantId: req.tenantId,
     };
 
-    // We need to update the object in memory for calculation helpers
     Object.assign(originalPO, updatedPOData);
 
     await applyPurchaseToProducts(originalPO);
-    const transactions = createTransactionsForPurchase(originalPO);
+    
+    // Pass extra fields from body to transaction helper
+    const transactions = await createTransactionsForPurchase(originalPO, status, paymentDate, dueDate);
+    
     if (transactions.length > 0) {
       await CashTransaction.insertMany(transactions);
     }
@@ -268,7 +368,6 @@ router.delete(
   authorize('owner', 'manager'),
   async (req, res) => {
     try {
-      // Strict Tenant check
       const poToDelete = await PurchaseOrder.findOne({
         _id: req.params.id,
         tenantId: req.tenantId,
