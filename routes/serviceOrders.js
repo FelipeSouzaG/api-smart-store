@@ -270,7 +270,11 @@ router.post(
                 const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
                 console.log("DEBUG: [OS ToggleStatus] Account Found?", !!account);
                 
-                const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId);
+                // Robust search: Check against 'id' (if virtual exists) or raw '_id'
+                const methodRule = account?.paymentMethods.find(m => 
+                    m.id === paymentMethodId || 
+                    (m._id && m._id.toString() === paymentMethodId)
+                );
                 console.log("DEBUG: [OS ToggleStatus] Method Found?", methodRule);
 
                 if (methodRule && methodRule.type === 'Credit') {
