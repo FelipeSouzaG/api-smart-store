@@ -2,11 +2,14 @@
 import express from 'express';
 const router = express.Router();
 import CashTransaction from '../models/CashTransaction.js';
+import CreditCardTransaction from '../models/CreditCardTransaction.js';
 import FinancialAccount from '../models/FinancialAccount.js';
 import { protect, authorize } from '../middleware/authMiddleware.js';
 import { TransactionType, TransactionCategory, TransactionStatus } from '../types.js';
+import { syncInvoiceRecord } from '../utils/financeHelpers.js';
 
 // GET all transactions (Scoped by Tenant)
+// Only returns CashTransactions (Actual cash flow + Invoice Aggregates)
 router.get('/', protect, authorize('owner', 'manager'), async (req, res) => {
   try {
     const transactions = await CashTransaction.find({
@@ -20,107 +23,91 @@ router.get('/', protect, authorize('owner', 'manager'), async (req, res) => {
 
 // POST a new transaction (for manual costs)
 router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
-  // Extract fields - Note: dueDate/paymentDate might come from frontend for manual entries
   const { description, amount, category, paymentMethodId, installments, financialAccountId, timestamp, dueDate, paymentDate, status } = req.body;
   
   if (!description || !amount || !category) {
     return res.status(400).json({ message: 'Descrição, valor e categoria são obrigatórios.' });
   }
 
-  // Competence Date (Data da Compra/Fato Gerador)
   const competenceDate = timestamp ? new Date(timestamp) : new Date();
 
-  // Base transaction structure
-  const transactionBase = {
-    description,
-    amount,
-    category,
-    type: TransactionType.EXPENSE, // Manual costs are always expense
-    tenantId: req.tenantId,
-    timestamp: competenceDate,
-    financialAccountId: financialAccountId === 'cash-box' ? 'cash-box' : financialAccountId, // Persist 'cash-box' string or ID
-    paymentMethodId: financialAccountId === 'cash-box' ? undefined : paymentMethodId // Clear method if cash
-  };
-
   try {
-    // 1. Check for Financial Rules (Credit Card Logic)
-    // Only proceed if it is a real account (not cash-box) and has a method selected
+    // 1. Check for Credit Card Logic
     if (financialAccountId && financialAccountId !== 'cash-box' && paymentMethodId) {
         const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
-        const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId);
+        const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId || (m._id && m._id.toString() === paymentMethodId));
 
-        // --- CREDIT CARD SPLIT LOGIC ---
-        // Generates dynamic costs for each installment based on card cycle
         if (methodRule && methodRule.type === 'Credit') {
+            // --- CREDIT CARD: Save to CreditCardTransaction & Sync Invoice ---
             const numInstallments = installments && installments > 0 ? parseInt(installments) : 1;
             const installmentValue = amount / numInstallments;
-            const newTransactions = [];
             
-            // Default config if missing
             const closingDay = methodRule.closingDay || 1;
             const dueDay = methodRule.dueDay || 10;
 
-            // Calculate First Invoice Month based on Purchase Date vs Closing Date
             const purchaseDay = competenceDate.getUTCDate();
             let targetMonth = competenceDate.getUTCMonth();
             let targetYear = competenceDate.getUTCFullYear();
 
-            // If purchase day >= closing day, the bill for this month is closed, so it goes to NEXT month
             if (purchaseDay >= closingDay) {
                 targetMonth += 1;
-                // Handle year rollover immediately for the start month
-                if (targetMonth > 11) {
-                    targetMonth = 0;
-                    targetYear += 1;
-                }
+                if (targetMonth > 11) { targetMonth = 0; targetYear += 1; }
             }
 
-            // Generate Installments
+            const ccTransactions = [];
+            const affectedDueDates = new Set();
+
             for (let i = 0; i < numInstallments; i++) {
-                // Calculate current installment month/year
                 let currentInstMonth = targetMonth + i;
                 let currentInstYear = targetYear;
+                while (currentInstMonth > 11) { currentInstMonth -= 12; currentInstYear += 1; }
                 
-                // Adjust for year rollover (e.g. month 13 becomes month 1 of next year)
-                while (currentInstMonth > 11) {
-                    currentInstMonth -= 12;
-                    currentInstYear += 1;
-                }
-                
-                // Construct specific Due Date (Noon UTC to be safe)
                 const autoDueDate = new Date(Date.UTC(currentInstYear, currentInstMonth, dueDay, 12, 0, 0));
-                
-                // Format description with installment info and card name
-                const instDesc = numInstallments > 1 
-                    ? `${description} (${i + 1}/${numInstallments})` 
-                    : `${description}`;
+                affectedDueDates.add(autoDueDate.toISOString());
 
-                newTransactions.push({
-                    ...transactionBase,
+                const instDesc = numInstallments > 1 ? `${description} (${i + 1}/${numInstallments})` : description;
+
+                ccTransactions.push({
+                    tenantId: req.tenantId,
                     description: instDesc,
                     amount: installmentValue,
-                    // FORCE PENDING: Credit card purchases are accounts payable inside the card invoice.
-                    // They stay PENDING until the user manually pays the invoice transaction.
-                    status: TransactionStatus.PENDING, 
+                    category,
+                    timestamp: competenceDate,
                     dueDate: autoDueDate,
-                    paymentDate: null // No cash outflow yet
+                    financialAccountId,
+                    paymentMethodId,
+                    installmentNumber: i + 1,
+                    totalInstallments: numInstallments,
+                    source: 'manual'
                 });
             }
 
-            const created = await CashTransaction.insertMany(newTransactions);
-            return res.status(201).json(created[0]); // Return first one for frontend feedback
+            await CreditCardTransaction.insertMany(ccTransactions);
+
+            // Sync Invoices for all affected dates
+            for (const dateStr of affectedDueDates) {
+                await syncInvoiceRecord(req.tenantId, financialAccountId, paymentMethodId, new Date(dateStr));
+            }
+
+            return res.status(201).json({ message: "Lançado no cartão e faturas atualizadas." });
         }
     }
 
-    // 2. Default Behavior (Cash Box, Bank-Debit, Bank-Pix, or Pending Bill)
+    // 2. Default Behavior (Cash Box, Bank-Debit, Bank-Pix) -> CashTransaction
     const transaction = new CashTransaction({
-        ...transactionBase,
-        status: status, // Use user provided status for non-credit card
+        description,
+        amount,
+        category,
+        type: TransactionType.EXPENSE,
+        tenantId: req.tenantId,
+        timestamp: competenceDate,
+        financialAccountId: financialAccountId === 'cash-box' ? 'cash-box' : financialAccountId,
+        paymentMethodId: financialAccountId === 'cash-box' ? undefined : paymentMethodId,
+        status: status,
         dueDate: dueDate ? new Date(dueDate) : undefined,
         paymentDate: paymentDate ? new Date(paymentDate) : undefined
     });
     
-    // Safety Fallback: If Paid but no paymentDate, default to now
     if (transaction.status === TransactionStatus.PAID && !transaction.paymentDate) {
         transaction.paymentDate = new Date();
     }
@@ -135,7 +122,6 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
 });
 
 // POST Batch Pay Invoice
-// Pays all transactions belonging to a specific card invoice (Account + Method + DueDate)
 router.post('/pay-invoice', protect, authorize('owner', 'manager'), async (req, res) => {
     const { financialAccountId, paymentMethodId, dueDate, paymentDate } = req.body;
 
@@ -144,32 +130,31 @@ router.post('/pay-invoice', protect, authorize('owner', 'manager'), async (req, 
     }
 
     try {
-        // Construct date range for the Due Date (Match the specific day)
-        // Since dueDate is stored as UTC Noon, we match the exact ISO string or range
         const targetDate = new Date(dueDate);
         const startOfDay = new Date(targetDate.setUTCHours(0, 0, 0, 0));
         const endOfDay = new Date(targetDate.setUTCHours(23, 59, 59, 999));
 
-        const result = await CashTransaction.updateMany(
+        // Update the Aggregate Invoice Record
+        const result = await CashTransaction.findOneAndUpdate(
             {
                 tenantId: req.tenantId,
                 financialAccountId,
                 paymentMethodId,
-                status: TransactionStatus.PENDING,
-                dueDate: {
-                    $gte: startOfDay,
-                    $lte: endOfDay
-                }
+                isInvoice: true,
+                dueDate: { $gte: startOfDay, $lte: endOfDay }
             },
             {
                 $set: {
                     status: TransactionStatus.PAID,
                     paymentDate: new Date(paymentDate)
                 }
-            }
+            },
+            { new: true }
         );
 
-        res.json({ message: 'Fatura atualizada.', updatedCount: result.modifiedCount });
+        if (!result) return res.status(404).json({ message: "Fatura não encontrada." });
+
+        res.json({ message: 'Fatura paga.', transaction: result });
 
     } catch (err) {
         console.error("Error paying invoice:", err);
@@ -178,17 +163,28 @@ router.post('/pay-invoice', protect, authorize('owner', 'manager'), async (req, 
 });
 
 // PUT (update) a transaction
+// NOTE: Editing manual costs that went to CC is complex. For now, we support basic updates for Cash Items.
 router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
   try {
     const { tenantId, ...updateData } = req.body;
+    
+    // Check if it is a Invoice Record (Auto-generated)
+    const existing = await CashTransaction.findOne({ _id: req.params.id, tenantId: req.tenantId });
+    if(existing && existing.isInvoice) {
+         // Allow only status/paymentDate update
+         existing.status = updateData.status || existing.status;
+         existing.paymentDate = updateData.paymentDate || existing.paymentDate;
+         await existing.save();
+         return res.json(existing);
+    }
+
     const updatedTransaction = await CashTransaction.findOneAndUpdate(
       { _id: req.params.id, tenantId: req.tenantId },
       updateData,
       { new: true }
     );
 
-    if (!updatedTransaction)
-      return res.status(404).json({ message: 'Transaction not found or access denied' });
+    if (!updatedTransaction) return res.status(404).json({ message: 'Transaction not found' });
     res.json(updatedTransaction);
   } catch (err) {
     res.status(400).json({ message: err.message });
@@ -198,13 +194,14 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
 // DELETE a transaction
 router.delete('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
   try {
-    const transaction = await CashTransaction.findOneAndDelete({
-      _id: req.params.id,
-      tenantId: req.tenantId,
-    });
+    const transaction = await CashTransaction.findOne({ _id: req.params.id, tenantId: req.tenantId });
+    if (!transaction) return res.status(404).json({ message: 'Not found' });
 
-    if (!transaction)
-      return res.status(404).json({ message: 'Transaction not found or access denied' });
+    if(transaction.isInvoice) {
+        return res.status(403).json({ message: "Não é possível excluir uma fatura consolidada diretamente. Exclua os itens individuais no menu Financeiro." });
+    }
+
+    await CashTransaction.deleteOne({ _id: req.params.id });
     res.json({ message: 'Transaction deleted successfully' });
   } catch (err) {
     res.status(500).json({ message: err.message });
