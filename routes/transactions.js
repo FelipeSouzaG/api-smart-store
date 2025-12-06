@@ -36,7 +36,6 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
     amount,
     category,
     type: TransactionType.EXPENSE, // Manual costs are always expense
-    status, // From frontend (might be overridden for Credit Card)
     tenantId: req.tenantId,
     timestamp: competenceDate,
     financialAccountId: financialAccountId === 'cash-box' ? 'cash-box' : financialAccountId, // Persist 'cash-box' string or ID
@@ -93,14 +92,14 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
                 
                 // Format description with installment info and card name
                 const instDesc = numInstallments > 1 
-                    ? `${description} - ${methodRule.name} (${i + 1}/${numInstallments})` 
-                    : `${description} - ${methodRule.name}`;
+                    ? `${description} (${i + 1}/${numInstallments})` 
+                    : `${description}`;
 
                 newTransactions.push({
                     ...transactionBase,
                     description: instDesc,
                     amount: installmentValue,
-                    // FORCE PENDING: Credit card purchases are accounts payable.
+                    // FORCE PENDING: Credit card purchases are accounts payable inside the card invoice.
                     // They stay PENDING until the user manually pays the invoice transaction.
                     status: TransactionStatus.PENDING, 
                     dueDate: autoDueDate,
@@ -116,6 +115,7 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
     // 2. Default Behavior (Cash Box, Bank-Debit, Bank-Pix, or Pending Bill)
     const transaction = new CashTransaction({
         ...transactionBase,
+        status: status, // Use user provided status for non-credit card
         dueDate: dueDate ? new Date(dueDate) : undefined,
         paymentDate: paymentDate ? new Date(paymentDate) : undefined
     });
