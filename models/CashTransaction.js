@@ -15,6 +15,11 @@ const CashTransactionSchema = new Schema({
   serviceOrderId: String,
   purchaseId: String,
   saleId: String,
+  // Financial Links
+  financialAccountId: String,
+  paymentMethodId: String,
+  // Flags
+  isInvoice: { type: Boolean, default: false } // Indica que este registro é um consolidado de fatura
 });
 
 CashTransactionSchema.set('toJSON', {
@@ -28,4 +33,3 @@ CashTransactionSchema.set('toJSON', {
 });
 
 export default mongoose.model('CashTransaction', CashTransactionSchema);
-
