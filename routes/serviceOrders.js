@@ -233,7 +233,7 @@ router.post(
 
         const transactionsToAdd = [];
 
-        // 1. REVENUE TRANSACTION
+        // 1. REVENUE TRANSACTION (Receita)
         transactionsToAdd.push({
           tenantId: req.tenantId,
           description: `Faturamento OS #${order.id} - ${order.serviceDescription}`,
@@ -248,121 +248,99 @@ router.post(
           financialAccountId: 'cash-box' 
         });
 
-        // 2. COST TRANSACTION (Only if totalCost > 0)
+        // 2. COST TRANSACTION (Despesa) - Only if cost > 0
         const costAmount = Number(order.totalCost);
         
-        if (costAmount > 0) {
-            // Default: Simple cash/pending if no details provided
-            let costStatus = TransactionStatus.PENDING;
-            let costDueDate = new Date();
-            let costPaymentDate = null;
-            let financialAccountId = 'cash-box';
-            let paymentMethodId = undefined;
+        if (costAmount > 0 && costPaymentDetails) {
+            
+            let costStatus = costPaymentDetails.status;
+            let financialAccountId = costPaymentDetails.financialAccountId || 'cash-box';
+            let paymentMethodId = costPaymentDetails.paymentMethodId;
             let isCreditCard = false;
             let numInstallments = 1;
+            
+            // Determine date based on status selection in frontend
+            const inputDate = costPaymentDetails.date ? new Date(costPaymentDetails.date) : new Date();
 
-            if (costPaymentDetails) {
-                costStatus = costPaymentDetails.status;
-                
-                // If user selected "Paid", use that date. If Pending, use provided due date.
-                const inputDate = costPaymentDetails.date ? new Date(costPaymentDetails.date) : new Date();
-                
-                if (costPaymentDetails.financialAccountId) {
-                    financialAccountId = costPaymentDetails.financialAccountId;
-                }
-                
-                // Check if it is a Credit Card payment method
-                if (financialAccountId !== 'cash-box' && costPaymentDetails.paymentMethodId) {
-                    paymentMethodId = costPaymentDetails.paymentMethodId;
+            // Check if it is a Credit Card payment method (Financeiro Table)
+            if (financialAccountId !== 'cash-box' && paymentMethodId) {
+                const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
+                const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId);
+
+                if (methodRule && methodRule.type === 'Credit') {
+                    isCreditCard = true;
+                    numInstallments = costPaymentDetails.installments || 1;
                     
-                    const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
-                    const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId);
+                    // --- CREDIT CARD LOGIC ---
+                    const installmentValue = costAmount / numInstallments;
+                    const closingDay = methodRule.closingDay || 1;
+                    const dueDay = methodRule.dueDay || 10;
+                    
+                    const pDate = new Date(); // Purchase Date is NOW
+                    const pDay = pDate.getDate();
+                    let targetMonth = pDate.getMonth();
+                    let targetYear = pDate.getFullYear();
 
-                    if (methodRule && methodRule.type === 'Credit') {
-                        isCreditCard = true;
-                        numInstallments = costPaymentDetails.installments || 1;
-                        
-                        // --- CREDIT CARD LOGIC ---
-                        const installmentValue = costAmount / numInstallments;
-                        const closingDay = methodRule.closingDay || 1;
-                        const dueDay = methodRule.dueDay || 10;
-                        
-                        const pDate = new Date(); // Purchase Date is NOW
-                        const pDay = pDate.getDate();
-                        let targetMonth = pDate.getMonth();
-                        let targetYear = pDate.getFullYear();
-
-                        // If purchased AFTER closing day, it goes to next month
-                        if (pDay >= closingDay) {
-                            targetMonth += 1;
-                            if (targetMonth > 11) { targetMonth = 0; targetYear += 1; }
-                        }
-
-                        for (let i = 0; i < numInstallments; i++) {
-                            let currentInstMonth = targetMonth + i;
-                            let currentInstYear = targetYear;
-                            while (currentInstMonth > 11) { currentInstMonth -= 12; currentInstYear += 1; }
-                            
-                            // Create UTC Date for consistency
-                            const autoDueDate = new Date(Date.UTC(currentInstYear, currentInstMonth, dueDay, 12, 0, 0));
-                            
-                            transactionsToAdd.push({
-                                tenantId: req.tenantId,
-                                description: `Custo OS #${order.id} - ${order.serviceDescription} (${i + 1}/${numInstallments})`,
-                                amount: installmentValue,
-                                type: TransactionType.EXPENSE,
-                                category: TransactionCategory.SERVICE_COST,
-                                status: TransactionStatus.PENDING, // IMPORTANT: Credit card costs are ALWAYS Pending until invoice payment
-                                timestamp: new Date(),
-                                dueDate: autoDueDate,
-                                paymentDate: null,
-                                serviceOrderId: order.id,
-                                financialAccountId,
-                                paymentMethodId
-                            });
-                        }
-                    }
-                }
-
-                // Logic B: Non-Credit Card (Cash/Pix/Debit or Manual Pending)
-                if (!isCreditCard) {
-                    if (costStatus === TransactionStatus.PAID) {
-                        costDueDate = inputDate;
-                        costPaymentDate = inputDate;
-                    } else {
-                        // Pending manual
-                        costDueDate = inputDate;
-                        costPaymentDate = null;
+                    // If purchased AFTER closing day, it goes to next month
+                    if (pDay >= closingDay) {
+                        targetMonth += 1;
+                        if (targetMonth > 11) { targetMonth = 0; targetYear += 1; }
                     }
 
-                    transactionsToAdd.push({
-                        tenantId: req.tenantId,
-                        description: `Custo OS #${order.id} - ${order.serviceDescription}`,
-                        amount: costAmount,
-                        type: TransactionType.EXPENSE,
-                        category: TransactionCategory.SERVICE_COST,
-                        status: costStatus,
-                        timestamp: new Date(), // Competence
-                        dueDate: costDueDate,
-                        paymentDate: costPaymentDate,
-                        serviceOrderId: order.id,
-                        financialAccountId,
-                        paymentMethodId
-                    });
+                    for (let i = 0; i < numInstallments; i++) {
+                        let currentInstMonth = targetMonth + i;
+                        let currentInstYear = targetYear;
+                        while (currentInstMonth > 11) { currentInstMonth -= 12; currentInstYear += 1; }
+                        
+                        // Create UTC Date for consistency (Noon UTC)
+                        const autoDueDate = new Date(Date.UTC(currentInstYear, currentInstMonth, dueDay, 12, 0, 0));
+                        
+                        transactionsToAdd.push({
+                            tenantId: req.tenantId,
+                            description: `Custo OS #${order.id} - ${order.serviceDescription} (${i + 1}/${numInstallments})`,
+                            amount: installmentValue,
+                            type: TransactionType.EXPENSE,
+                            category: TransactionCategory.SERVICE_COST,
+                            // FORCE PENDING: Credit card costs are essentially "Accounts Payable" until the bill is paid.
+                            status: TransactionStatus.PENDING, 
+                            timestamp: new Date(),
+                            dueDate: autoDueDate,
+                            paymentDate: null,
+                            serviceOrderId: order.id,
+                            financialAccountId,
+                            paymentMethodId
+                        });
+                    }
                 }
-            } else {
-                // Fallback if no details: Create a simple pending cash transaction
+            }
+
+            // Logic B: Normal Payment (Cash/Pix/Debit) OR Manual Pending
+            if (!isCreditCard) {
+                let costDueDate, costPaymentDate;
+
+                if (costStatus === TransactionStatus.PAID) {
+                    // If Paid, it impacts Cash/Bank Balance immediately
+                    costDueDate = inputDate;
+                    costPaymentDate = inputDate;
+                } else {
+                    // If Pending, it's an Account Payable in 'Caixa'
+                    costDueDate = inputDate;
+                    costPaymentDate = null;
+                }
+
                 transactionsToAdd.push({
                     tenantId: req.tenantId,
                     description: `Custo OS #${order.id} - ${order.serviceDescription}`,
                     amount: costAmount,
                     type: TransactionType.EXPENSE,
                     category: TransactionCategory.SERVICE_COST,
-                    status: TransactionStatus.PENDING,
-                    timestamp: new Date(),
-                    dueDate: new Date(),
+                    status: costStatus,
+                    timestamp: new Date(), // Competence
+                    dueDate: costDueDate,
+                    paymentDate: costPaymentDate,
                     serviceOrderId: order.id,
-                    financialAccountId: 'cash-box'
+                    financialAccountId,
+                    paymentMethodId
                 });
             }
         }
