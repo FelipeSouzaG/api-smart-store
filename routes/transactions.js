@@ -32,7 +32,7 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
   const competenceDate = timestamp ? new Date(timestamp) : new Date();
 
   try {
-    // 1. Check for Credit Card Logic
+    // 1. Check for Credit Card Logic (Independent of status)
     if (financialAccountId && financialAccountId !== 'cash-box' && paymentMethodId) {
         const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
         const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId || (m._id && m._id.toString() === paymentMethodId));
@@ -89,6 +89,7 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
                 await syncInvoiceRecord(req.tenantId, financialAccountId, paymentMethodId, new Date(dateStr));
             }
 
+            // Return early to prevent saving to CashTransaction
             return res.status(201).json({ message: "Lançado no cartão e faturas atualizadas." });
         }
     }
