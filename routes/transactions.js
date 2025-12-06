@@ -39,13 +39,14 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
     status, // From frontend
     tenantId: req.tenantId,
     timestamp: competenceDate,
-    financialAccountId,
-    paymentMethodId
+    financialAccountId: financialAccountId === 'cash-box' ? 'cash-box' : financialAccountId, // Persist 'cash-box' string or ID
+    paymentMethodId: financialAccountId === 'cash-box' ? undefined : paymentMethodId // Clear method if cash
   };
 
   try {
     // 1. Check for Financial Rules (Credit Card Logic)
-    if (paymentMethodId && financialAccountId) {
+    // Only proceed if it is a real account (not cash-box) and has a method selected
+    if (financialAccountId && financialAccountId !== 'cash-box' && paymentMethodId) {
         const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
         const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId);
 
@@ -60,10 +61,12 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
             const dueDay = methodRule.dueDay || 10;
 
             // Calculate First Due Date based on Purchase Date vs Closing Date
+            // Use competenceDate (Date of Purchase) to decide the bill month
             let referenceDate = new Date(competenceDate); 
+            const purchaseDay = referenceDate.getDate();
             
-            // If purchase day >= closing day, bill goes to next month
-            if (referenceDate.getDate() >= closingDay) {
+            // Logic: If purchase day >= closing day, bill goes to next month
+            if (purchaseDay >= closingDay) {
                 referenceDate.setMonth(referenceDate.getMonth() + 1);
             }
 
@@ -91,7 +94,7 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
         }
     }
 
-    // 2. Default Behavior (Cash, Pix, Debit, or Pending Bill)
+    // 2. Default Behavior (Cash Box, Bank-Debit, Bank-Pix, or Pending Bill)
     // Use the dates provided by the frontend
     const transaction = new CashTransaction({
         ...transactionBase,
