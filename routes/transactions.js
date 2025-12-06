@@ -9,7 +9,6 @@ import { TransactionType, TransactionCategory, TransactionStatus } from '../type
 // GET all transactions (Scoped by Tenant)
 router.get('/', protect, authorize('owner', 'manager'), async (req, res) => {
   try {
-    // CRITICAL: Filter by tenantId to prevent data leakage
     const transactions = await CashTransaction.find({
       tenantId: req.tenantId,
     }).sort({ timestamp: -1 });
@@ -20,78 +19,89 @@ router.get('/', protect, authorize('owner', 'manager'), async (req, res) => {
 });
 
 // POST a new transaction (for manual costs)
-// UPDATED: Handle Financial Rules (Credit Card Installments)
 router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
-  const { description, amount, category, paymentMethodId, installments, financialAccountId } = req.body;
+  const { description, amount, category, paymentMethodId, installments, financialAccountId, timestamp } = req.body;
   
   if (!description || !amount || !category) {
-    return res
-      .status(400)
-      .json({ message: 'Descrição, valor e categoria são obrigatórios.' });
+    return res.status(400).json({ message: 'Descrição, valor e categoria são obrigatórios.' });
   }
+
+  // Competence Date (Data da Compra/Fato Gerador)
+  const competenceDate = timestamp ? new Date(timestamp) : new Date();
 
   // Base transaction structure
   const transactionBase = {
     ...req.body,
     tenantId: req.tenantId,
-    timestamp: req.body.timestamp || new Date(), // Use provided timestamp or now (Launch Date)
+    timestamp: competenceDate,
   };
 
   try {
-    // Special Logic for Credit Card Payment (Installments)
-    if (paymentMethodId && financialAccountId && installments > 1) {
+    // 1. Check for Financial Rules (Credit Card Logic)
+    if (paymentMethodId && financialAccountId) {
         const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
         const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId);
 
+        // --- CREDIT CARD LOGIC ---
         if (methodRule && methodRule.type === 'Credit') {
-            const installmentValue = amount / installments;
+            const numInstallments = installments && installments > 0 ? installments : 1;
+            const installmentValue = amount / numInstallments;
             const newTransactions = [];
+            
             const closingDay = methodRule.closingDay || 1;
             const dueDay = methodRule.dueDay || 10;
 
-            // Generate transactions for each installment
-            let currentRefDate = new Date();
-            // Start calculation based on current date vs closing date
-            if (currentRefDate.getDate() >= closingDay) {
-                // If past closing, bill comes next month
-                currentRefDate.setMonth(currentRefDate.getMonth() + 1);
+            // Calculate First Due Date based on Purchase Date vs Closing Date
+            // Example: Buy 20th. Close 25th. Bill comes THIS month (or next month depending on due day logic).
+            // Standard Logic: If Buy Date < Closing Date, it enters current cycle. If Buy Date >= Closing Date, it enters NEXT cycle.
+            
+            let referenceDate = new Date(competenceDate); // Start calculation from purchase date
+            
+            // If purchase is AFTER closing day, bump to next month's bill
+            if (referenceDate.getDate() >= closingDay) {
+                referenceDate.setMonth(referenceDate.getMonth() + 1);
             }
 
-            for (let i = 0; i < installments; i++) {
-                // Set due date to configured day
-                const dueDate = new Date(currentRefDate.getFullYear(), currentRefDate.getMonth(), dueDay, 12, 0, 0);
+            // Generate Installments
+            for (let i = 0; i < numInstallments; i++) {
+                // Determine Due Date: The configured Due Day of the reference month
+                // We create a new date object to avoid mutating referenceDate incorrectly in loop
+                let targetMonth = referenceDate.getMonth() + i; 
+                let targetYear = referenceDate.getFullYear();
                 
-                // If PaymentStatus is PAID, we assume user paid it NOW (pre-payment? unlikely for credit). 
-                // Usually Credit Card costs are registered as Pending until bill is paid, OR Paid if reconciling old bills.
-                // However, user said "Credit Inter accumulates in competency". 
-                // We will create them as PENDING due to future date, or PAID if user explicitly said so (reconciling).
-                // But logically, future installments are Pending.
+                // Adjust year if month overflows (handled by Date constructor usually, but explicit is safer)
+                const dueDate = new Date(targetYear, targetMonth, dueDay, 12, 0, 0);
                 
-                // Override status if it's future
-                const status = (req.body.status === 'Pago' && i === 0 && dueDate <= new Date()) ? 'Pago' : 'Pendente'; 
-                // Wait, credit card purchase creates a debt now, paid later. 
-                // The logical flow: Register Cost -> Status PENDING (Waiting Bill). 
-                
+                // Check for year rollover in case Date constructor behaves oddly with index loop
+                // (Date(2023, 13, 1) becomes Feb 2024 automatically, so standard JS Date is fine)
+
                 newTransactions.push({
                     ...transactionBase,
-                    description: `${description} (${i + 1}/${installments})`,
+                    description: numInstallments > 1 ? `${description} (${i + 1}/${numInstallments})` : description,
                     amount: installmentValue,
+                    // FORCE PENDING: Credit card purchases are debts to be paid later.
+                    status: TransactionStatus.PENDING, 
                     dueDate: dueDate,
-                    paymentDate: status === 'Pago' ? req.body.paymentDate : null, // Only set payment date if actually paid
-                    status: status
+                    paymentDate: null, // No cash outflow yet
+                    financialAccountId,
+                    paymentMethodId
                 });
-
-                // Move to next month
-                currentRefDate.setMonth(currentRefDate.getMonth() + 1);
             }
 
             const created = await CashTransaction.insertMany(newTransactions);
-            return res.status(201).json(created[0]); // Return first as confirmation
+            return res.status(201).json(created[0]); 
         }
     }
 
-    // Default Behavior (Single Transaction)
+    // 2. Default Behavior (Cash, Pix, Debit - Immediate or Scheduled)
+    // For Debit/Pix, if status is PAID, paymentDate should be set.
     const transaction = new CashTransaction(transactionBase);
+    
+    // Sanity check: If Paid but no paymentDate, default to now
+    if (transaction.status === TransactionStatus.PAID && !transaction.paymentDate) {
+        transaction.paymentDate = new Date();
+    }
+
     const newTransaction = await transaction.save();
     res.status(201).json(newTransaction);
 
@@ -101,13 +111,10 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
   }
 });
 
-// PUT (update) a transaction (Scoped by Tenant)
+// PUT (update) a transaction
 router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
   try {
-    // SECURITY: Strip tenantId from body to prevent moving transaction to another tenant
     const { tenantId, ...updateData } = req.body;
-
-    // Security: Ensure we only update transactions belonging to this tenant
     const updatedTransaction = await CashTransaction.findOneAndUpdate(
       { _id: req.params.id, tenantId: req.tenantId },
       updateData,
@@ -115,37 +122,27 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
     );
 
     if (!updatedTransaction)
-      return res
-        .status(404)
-        .json({ message: 'Transaction not found or access denied' });
+      return res.status(404).json({ message: 'Transaction not found or access denied' });
     res.json(updatedTransaction);
   } catch (err) {
     res.status(400).json({ message: err.message });
   }
 });
 
-// DELETE a transaction (Scoped by Tenant)
-router.delete(
-  '/:id',
-  protect,
-  authorize('owner', 'manager'),
-  async (req, res) => {
-    try {
-      // Security: Ensure we only delete transactions belonging to this tenant
-      const transaction = await CashTransaction.findOneAndDelete({
-        _id: req.params.id,
-        tenantId: req.tenantId,
-      });
+// DELETE a transaction
+router.delete('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
+  try {
+    const transaction = await CashTransaction.findOneAndDelete({
+      _id: req.params.id,
+      tenantId: req.tenantId,
+    });
 
-      if (!transaction)
-        return res
-          .status(404)
-          .json({ message: 'Transaction not found or access denied' });
-      res.json({ message: 'Transaction deleted successfully' });
-    } catch (err) {
-      res.status(500).json({ message: err.message });
-    }
+    if (!transaction)
+      return res.status(404).json({ message: 'Transaction not found or access denied' });
+    res.json({ message: 'Transaction deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
   }
-);
+});
 
 export default router;
