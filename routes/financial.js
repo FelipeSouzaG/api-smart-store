@@ -15,18 +15,18 @@ router.get('/', protect, authorize('owner', 'manager'), async (req, res) => {
   }
 });
 
-// GET Credit Card Statement Items (Sub-items of an invoice)
+// GET Credit Card Transactions (Statement)
+// Returns individual credit card purchases/costs
 router.get('/statement', protect, authorize('owner', 'manager'), async (req, res) => {
     const { accountId, methodId } = req.query;
-    if(!accountId || !methodId) return res.status(400).json({message: "IDs required"});
+    
+    // Build query based on provided filters, or default to all for tenant
+    const query = { tenantId: req.tenantId };
+    if (accountId) query.financialAccountId = accountId;
+    if (methodId) query.paymentMethodId = methodId;
 
     try {
-        const items = await CreditCardTransaction.find({
-            tenantId: req.tenantId,
-            financialAccountId: accountId,
-            paymentMethodId: methodId
-        }).sort({ dueDate: -1, timestamp: -1 });
-        
+        const items = await CreditCardTransaction.find(query).sort({ timestamp: -1, dueDate: -1 });
         res.json(items);
     } catch (err) {
         res.status(500).json({ message: err.message });
