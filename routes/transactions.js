@@ -134,6 +134,49 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
   }
 });
 
+// POST Batch Pay Invoice
+// Pays all transactions belonging to a specific card invoice (Account + Method + DueDate)
+router.post('/pay-invoice', protect, authorize('owner', 'manager'), async (req, res) => {
+    const { financialAccountId, paymentMethodId, dueDate, paymentDate } = req.body;
+
+    if (!financialAccountId || !paymentMethodId || !dueDate || !paymentDate) {
+        return res.status(400).json({ message: 'Dados insuficientes para baixar fatura.' });
+    }
+
+    try {
+        // Construct date range for the Due Date (Match the specific day)
+        // Since dueDate is stored as UTC Noon, we match the exact ISO string or range
+        const targetDate = new Date(dueDate);
+        const startOfDay = new Date(targetDate.setUTCHours(0, 0, 0, 0));
+        const endOfDay = new Date(targetDate.setUTCHours(23, 59, 59, 999));
+
+        const result = await CashTransaction.updateMany(
+            {
+                tenantId: req.tenantId,
+                financialAccountId,
+                paymentMethodId,
+                status: TransactionStatus.PENDING,
+                dueDate: {
+                    $gte: startOfDay,
+                    $lte: endOfDay
+                }
+            },
+            {
+                $set: {
+                    status: TransactionStatus.PAID,
+                    paymentDate: new Date(paymentDate)
+                }
+            }
+        );
+
+        res.json({ message: 'Fatura atualizada.', updatedCount: result.modifiedCount });
+
+    } catch (err) {
+        console.error("Error paying invoice:", err);
+        res.status(500).json({ message: err.message });
+    }
+});
+
 // PUT (update) a transaction
 router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
   try {
