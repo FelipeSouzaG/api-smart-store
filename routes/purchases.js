@@ -94,7 +94,14 @@ const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymen
       const methodRule = account?.paymentMethods.find(m => m.id === paymentDetails.paymentMethodId || (m._id && m._id.toString() === paymentDetails.paymentMethodId));
 
       if (methodRule && methodRule.type === 'Credit') {
-          let numInstallments = paymentDetails.installments && paymentDetails.installments > 0 ? paymentDetails.installments : 1;
+          // Determine number of installments: prefer 'installmentCount' field, fallback to array length, default to 1.
+          let numInstallments = 1;
+          if (paymentDetails.installmentCount && paymentDetails.installmentCount > 0) {
+              numInstallments = paymentDetails.installmentCount;
+          } else if (Array.isArray(paymentDetails.installments) && paymentDetails.installments.length > 0) {
+              numInstallments = paymentDetails.installments.length;
+          }
+
           const installmentValue = totalCost / numInstallments;
           const closingDay = methodRule.closingDay || 1;
           const dueDay = methodRule.dueDay || 10;
