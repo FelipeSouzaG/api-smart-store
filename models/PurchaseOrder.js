@@ -19,7 +19,8 @@ const PaymentDetailsSchema = new Schema({
     method: { type: String, required: true },
     paymentDate: Date,
     bank: String,
-    installments: [InstallmentSchema],
+    installments: [InstallmentSchema], // Array for detailed installments (e.g. Bank Slip)
+    installmentCount: { type: Number }, // Number of installments (e.g. Credit Card)
     // New Fields for Financial Account Linking
     financialAccountId: String,
     paymentMethodId: String
