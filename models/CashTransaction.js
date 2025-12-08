@@ -2,6 +2,14 @@
 import mongoose from 'mongoose';
 const { Schema } = mongoose;
 
+const InstallmentSchema = new Schema({
+  number: Number,
+  amount: Number,
+  dueDate: Date,
+  paymentDate: Date,
+  status: { type: String, default: 'Pendente' }
+}, { _id: false });
+
 const CashTransactionSchema = new Schema({
   tenantId: { type: String, required: true, index: true },
   description: { type: String, required: true },
@@ -10,16 +18,17 @@ const CashTransactionSchema = new Schema({
   category: { type: String, required: true },
   status: { type: String, required: true },
   timestamp: { type: Date, default: Date.now }, // Data de Lançamento / Competência
-  dueDate: Date, // Data de Vencimento
-  paymentDate: Date, // Data da Baixa / Pagamento Real
+  dueDate: Date, // Data de Vencimento (do registro pai ou única)
+  paymentDate: Date, // Data da Baixa (do registro pai ou única)
   serviceOrderId: String,
   purchaseId: String,
   saleId: String,
   // Financial Links
   financialAccountId: String,
   paymentMethodId: String,
-  // Flags
-  isInvoice: { type: Boolean, default: false } // Indica que este registro é um consolidado de fatura
+  // Flags & Complex Structures
+  isInvoice: { type: Boolean, default: false }, // Indica consolidado de cartão
+  installments: [InstallmentSchema] // Array de parcelas para custos parcelados (Boletos/Bancos)
 });
 
 CashTransactionSchema.set('toJSON', {
