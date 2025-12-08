@@ -89,7 +89,7 @@ const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymen
   const descriptionBase = `Compra #${id} - ${supplierInfo.name}`;
 
   // 1. Credit Card Logic
-  if (paymentDetails.financialAccountId && paymentDetails.financialAccountId !== 'cash-box' && paymentDetails.paymentMethodId) {
+  if (paymentDetails.financialAccountId && paymentDetails.financialAccountId !== 'cash-box' && paymentDetails.financialAccountId !== 'boleto' && paymentDetails.paymentMethodId) {
       const account = await FinancialAccount.findOne({ _id: paymentDetails.financialAccountId, tenantId });
       const methodRule = account?.paymentMethods.find(m => m.id === paymentDetails.paymentMethodId || (m._id && m._id.toString() === paymentDetails.paymentMethodId));
 
@@ -153,11 +153,33 @@ const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymen
       }
   }
 
-  // 2. Default / Cash Logic
+  // 2. Split Payment Logic (Boleto or Manual Installments via Cash)
+  // If payment method is Boleto AND there are multiple installments defined
+  if (paymentDetails.method === PaymentMethod.BANK_SLIP && Array.isArray(paymentDetails.installments) && paymentDetails.installments.length > 0) {
+        const transactionsToAdd = paymentDetails.installments.map((inst) => ({
+            tenantId,
+            description: `${descriptionBase} (${inst.installmentNumber}/${paymentDetails.installments.length})`,
+            amount: inst.amount,
+            type: TransactionType.EXPENSE,
+            category: TransactionCategory.PRODUCT_PURCHASE,
+            status: TransactionStatus.PENDING, // Always pending initially for Boletos
+            timestamp: new Date(purchaseOrder.createdAt),
+            dueDate: new Date(inst.dueDate),
+            purchaseId: id,
+            financialAccountId: 'boleto', // Logic marker, creates cash transaction
+            paymentMethodId: undefined
+        }));
+        
+        await CashTransaction.insertMany(transactionsToAdd);
+        return;
+  }
+
+  // 3. Default / Single Cash Transaction Logic (Immediate Payment or Single Future Payment)
   const transactionsToAdd = [];
+  // Determine Status: If passed explicitly use it, otherwise infer
   const finalStatus = reqStatus || (paymentDetails.method === PaymentMethod.BANK_SLIP ? TransactionStatus.PENDING : TransactionStatus.PAID);
   
-  // Logic for immediate payment or manual bank slip
+  // Logic for immediate payment or single manual entry
   transactionsToAdd.push({
     tenantId,
     description: descriptionBase,
@@ -169,7 +191,7 @@ const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymen
     dueDate: reqDueDate ? new Date(reqDueDate) : (paymentDetails.paymentDate || new Date()),
     paymentDate: finalStatus === TransactionStatus.PAID ? (reqPaymentDate ? new Date(reqPaymentDate) : (paymentDetails.paymentDate || new Date())) : undefined,
     purchaseId: id,
-    financialAccountId: paymentDetails.financialAccountId || 'cash-box',
+    financialAccountId: paymentDetails.financialAccountId === 'boleto' ? undefined : (paymentDetails.financialAccountId || 'cash-box'),
     paymentMethodId: paymentDetails.paymentMethodId
   });
   
@@ -306,3 +328,4 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
 });
 
 export default router;
+
