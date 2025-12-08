@@ -3,7 +3,6 @@ import express from 'express';
 const router = express.Router();
 import FinancialAccount from '../models/FinancialAccount.js';
 import CreditCardTransaction from '../models/CreditCardTransaction.js';
-import CashTransaction from '../models/CashTransaction.js';
 import { protect, authorize } from '../middleware/authMiddleware.js';
 
 // GET all accounts
@@ -17,64 +16,18 @@ router.get('/', protect, authorize('owner', 'manager'), async (req, res) => {
 });
 
 // GET Credit Card Transactions (Statement)
-// Returns individual credit card purchases/costs from BOTH collections
+// Returns individual credit card purchases/costs
 router.get('/statement', protect, authorize('owner', 'manager'), async (req, res) => {
     const { accountId, methodId } = req.query;
     
-    // Default filters
-    const ccQuery = { tenantId: req.tenantId };
-    const cashQuery = { tenantId: req.tenantId, isInvoice: false };
-
-    if (accountId) {
-        ccQuery.financialAccountId = accountId;
-        cashQuery.financialAccountId = accountId;
-    }
-    if (methodId) {
-        ccQuery.paymentMethodId = methodId;
-        cashQuery.paymentMethodId = methodId;
-    }
+    // Build query based on provided filters, or default to all for tenant
+    const query = { tenantId: req.tenantId };
+    if (accountId) query.financialAccountId = accountId;
+    if (methodId) query.paymentMethodId = methodId;
 
     try {
-        // 1. Fetch from CreditCardTransaction (Purchases, OS)
-        const ccItems = await CreditCardTransaction.find(ccQuery).lean();
-
-        // 2. Fetch from CashTransaction (Manual Costs with Credit Card)
-        // We must unwind the installments to match the flat structure of the statement
-        const cashDocs = await CashTransaction.find(cashQuery).lean();
-        
-        const cashItemsFlat = [];
-        cashDocs.forEach(doc => {
-            // Only include docs that actually have installments (Credit structure)
-            if (doc.installments && doc.installments.length > 0) {
-                doc.installments.forEach(inst => {
-                    cashItemsFlat.push({
-                        _id: `${doc._id}_${inst.number}`, // Virtual ID
-                        id: `${doc._id}_${inst.number}`,
-                        description: `${doc.description} (${inst.number}/${doc.installments.length})`,
-                        amount: inst.amount,
-                        category: doc.category,
-                        timestamp: doc.timestamp,
-                        dueDate: inst.dueDate, // The specific installment due date
-                        financialAccountId: doc.financialAccountId,
-                        paymentMethodId: doc.paymentMethodId,
-                        installmentNumber: inst.number,
-                        totalInstallments: doc.installments.length,
-                        source: 'manual'
-                    });
-                });
-            }
-        });
-
-        // 3. Merge and Sort
-        const allItems = [...ccItems, ...cashItemsFlat].sort((a, b) => {
-            // Sort by Purchase Date DESC, then Due Date DESC
-            const dateA = new Date(a.timestamp).getTime();
-            const dateB = new Date(b.timestamp).getTime();
-            if (dateA !== dateB) return dateB - dateA;
-            return new Date(b.dueDate).getTime() - new Date(a.dueDate).getTime();
-        });
-
-        res.json(allItems);
+        const items = await CreditCardTransaction.find(query).sort({ timestamp: -1, dueDate: -1 });
+        res.json(items);
     } catch (err) {
         res.status(500).json({ message: err.message });
     }
