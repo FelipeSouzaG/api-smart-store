@@ -195,34 +195,43 @@ router.post('/pay-invoice', protect, authorize('owner', 'manager'), async (req, 
 });
 
 // PUT (update) a transaction
+// This handles BOTH Cash Transactions AND Manual Credit Card Transactions
 router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
   const { tenantId, description, amount, category, financialAccountId, paymentMethodId, installments, timestamp, status, ...otherData } = req.body;
   const competenceDate = timestamp ? new Date(timestamp) : new Date();
 
   try {
-    // 1. Check if it is an Invoice Record (Auto-generated)
-    const existing = await CashTransaction.findOne({ _id: req.params.id, tenantId: req.tenantId });
-    if(existing && existing.isInvoice) {
-         // Allow only status/paymentDate update
-         existing.status = status || existing.status;
-         existing.paymentDate = otherData.paymentDate || existing.paymentDate;
-         await existing.save();
-         return res.json(existing);
+    // --- STEP 1: LOCATE AND REMOVE OLD RECORD ---
+    let originalType = 'none'; // 'cash' or 'credit'
+    
+    // Check CashTransaction First
+    const existingCash = await CashTransaction.findOne({ _id: req.params.id, tenantId: req.tenantId });
+    if(existingCash) {
+         if(existingCash.isInvoice) return res.status(403).json({ message: "Edite as compras individuais da fatura." });
+         await CashTransaction.deleteOne({ _id: req.params.id });
+         originalType = 'cash';
+    } else {
+        // Check CreditCardTransaction
+        const existingCC = await CreditCardTransaction.findOne({ _id: req.params.id, tenantId: req.tenantId });
+        if (existingCC) {
+            if (existingCC.source !== 'manual') return res.status(403).json({ message: "Edite a Compra ou OS de origem." });
+            await CreditCardTransaction.deleteOne({ _id: req.params.id });
+            await syncInvoiceRecord(req.tenantId, existingCC.financialAccountId, existingCC.paymentMethodId, existingCC.dueDate);
+            originalType = 'credit';
+        }
     }
 
-    if (!existing) return res.status(404).json({ message: 'Transaction not found' });
+    if (originalType === 'none') return res.status(404).json({ message: 'Lançamento não encontrado para edição.' });
 
-    // 2. Logic: Moving from Cash to Credit Card?
-    // If the new update has credit card details, we must DELETE this CashTransaction and CREATE CreditCardTransactions.
+    // --- STEP 2: CREATE NEW RECORD (Based on updated data) ---
+    // Logic mirrored from POST
+    
+    // 2.1 Credit Card Logic
     if (financialAccountId && financialAccountId !== 'cash-box' && financialAccountId !== 'boleto' && paymentMethodId) {
         const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
         const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId || (m._id && m._id.toString() === paymentMethodId));
 
         if (methodRule && methodRule.type === 'Credit') {
-             // DELETE original CashTransaction
-             await CashTransaction.deleteOne({ _id: req.params.id });
-
-             // CREATE CreditCardTransaction logic (Duplicate from POST)
              const numInstallments = installments && installments > 0 ? parseInt(installments) : 1;
              const installmentValue = amount / numInstallments;
              
@@ -268,33 +277,61 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
              }
 
              await CreditCardTransaction.insertMany(ccTransactions);
-
-             // Sync Invoices for all affected dates
              for (const dateStr of affectedDueDates) {
                  await syncInvoiceRecord(req.tenantId, financialAccountId, paymentMethodId, new Date(dateStr));
              }
-
-             return res.json({ message: "Transação movida para cartão de crédito." });
+             return res.json({ message: "Atualizado e movido para Fatura de Cartão." });
         }
     }
 
-    // 3. Normal Update (Cash/Debit/Pix/Pending)
-    // Only update fields that are passed
-    const updatePayload = {
-        description, amount, category, financialAccountId, paymentMethodId, timestamp: competenceDate, status, ...otherData
-    };
+    // 2.2 Boleto Split Logic
+    if (financialAccountId === 'boleto' && status === TransactionStatus.PENDING) {
+        const numInstallments = installments && installments > 0 ? parseInt(installments) : 1;
+        if (numInstallments > 1) {
+            const installmentValue = amount / numInstallments;
+            const baseDueDate = otherData.dueDate ? new Date(otherData.dueDate) : new Date();
+            const transactionsToAdd = [];
+
+            for (let i = 0; i < numInstallments; i++) {
+                const instDate = new Date(baseDueDate);
+                instDate.setMonth(baseDueDate.getMonth() + i);
+                
+                transactionsToAdd.push({
+                    tenantId: req.tenantId,
+                    description: `${description} (${i + 1}/${numInstallments})`,
+                    amount: installmentValue,
+                    type: TransactionType.EXPENSE,
+                    category,
+                    status: TransactionStatus.PENDING,
+                    timestamp: competenceDate,
+                    dueDate: instDate,
+                    financialAccountId: 'boleto',
+                    paymentMethodId: undefined
+                });
+            }
+            await CashTransaction.insertMany(transactionsToAdd);
+            return res.status(201).json({ message: "Atualizado para Boletos Parcelados." });
+        }
+    }
+
+    // 2.3 Standard Cash/Debit/Pix Logic
+    const transaction = new CashTransaction({
+        description,
+        amount,
+        category,
+        type: TransactionType.EXPENSE,
+        tenantId: req.tenantId,
+        timestamp: competenceDate,
+        financialAccountId: financialAccountId === 'boleto' ? 'boleto' : (financialAccountId === 'cash-box' ? 'cash-box' : financialAccountId),
+        paymentMethodId: (financialAccountId === 'cash-box' || financialAccountId === 'boleto') ? undefined : paymentMethodId,
+        status: status,
+        dueDate: otherData.dueDate ? new Date(otherData.dueDate) : undefined,
+        paymentDate: (status === TransactionStatus.PAID) ? (otherData.paymentDate ? new Date(otherData.paymentDate) : new Date()) : undefined
+    });
     
-    // Ensure dates are parsed if present
-    if (otherData.dueDate) updatePayload.dueDate = new Date(otherData.dueDate);
-    if (otherData.paymentDate) updatePayload.paymentDate = new Date(otherData.paymentDate);
+    const newTransaction = await transaction.save();
+    res.json(newTransaction);
 
-    const updatedTransaction = await CashTransaction.findOneAndUpdate(
-      { _id: req.params.id, tenantId: req.tenantId },
-      updatePayload,
-      { new: true }
-    );
-
-    res.json(updatedTransaction);
   } catch (err) {
     res.status(400).json({ message: err.message });
   }
