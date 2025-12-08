@@ -303,15 +303,35 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
 // DELETE a transaction
 router.delete('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
   try {
+    // 1. Try finding in CashTransaction first
     const transaction = await CashTransaction.findOne({ _id: req.params.id, tenantId: req.tenantId });
-    if (!transaction) return res.status(404).json({ message: 'Not found' });
-
-    if(transaction.isInvoice) {
-        return res.status(403).json({ message: "Não é possível excluir uma fatura consolidada diretamente. Exclua os itens individuais no menu Financeiro." });
+    
+    if (transaction) {
+        if(transaction.isInvoice) {
+            return res.status(403).json({ message: "Não é possível excluir uma fatura consolidada diretamente. Exclua os itens individuais no menu Financeiro." });
+        }
+        await CashTransaction.deleteOne({ _id: req.params.id });
+        return res.json({ message: 'Transaction deleted successfully' });
     }
 
-    await CashTransaction.deleteOne({ _id: req.params.id });
-    res.json({ message: 'Transaction deleted successfully' });
+    // 2. Not in Cash? Try CreditCardTransaction (Manual entries)
+    const ccTransaction = await CreditCardTransaction.findOne({ _id: req.params.id, tenantId: req.tenantId });
+    if (ccTransaction) {
+        if (ccTransaction.source !== 'manual') {
+             return res.status(403).json({ message: "Este lançamento está vinculado a uma Compra ou OS. Exclua o registro de origem." });
+        }
+
+        // Delete CC transaction
+        await CreditCardTransaction.deleteOne({ _id: req.params.id });
+        
+        // Sync Invoice to reflect removal
+        await syncInvoiceRecord(req.tenantId, ccTransaction.financialAccountId, ccTransaction.paymentMethodId, ccTransaction.dueDate);
+        
+        return res.json({ message: 'Credit card cost deleted successfully' });
+    }
+
+    return res.status(404).json({ message: 'Not found' });
+
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
