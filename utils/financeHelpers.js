@@ -5,17 +5,17 @@ import FinancialAccount from '../models/FinancialAccount.js';
 import { TransactionType, TransactionCategory, TransactionStatus } from '../types.js';
 
 // Re-calculates the total Invoice amount for a specific Card and Due Date
-// and updates (or creates/deletes) the single record in CashTransaction.
+// Now aggregates BOTH CreditCardTransaction (from Purchases/OS) AND CashTransaction (Manual Costs)
 export const syncInvoiceRecord = async (tenantId, financialAccountId, paymentMethodId, dueDate) => {
     try {
-        // 1. Calculate Total from CreditCardTransactions
         // We define the range for the "Due Date" day (ignoring time)
         const startOfDay = new Date(dueDate);
         startOfDay.setUTCHours(0, 0, 0, 0);
         const endOfDay = new Date(dueDate);
         endOfDay.setUTCHours(23, 59, 59, 999);
 
-        const result = await CreditCardTransaction.aggregate([
+        // 1. Calculate Total from Legacy/Auto CreditCardTransactions (Purchases/OS)
+        const ccResult = await CreditCardTransaction.aggregate([
             {
                 $match: {
                     tenantId,
@@ -31,10 +31,39 @@ export const syncInvoiceRecord = async (tenantId, financialAccountId, paymentMet
                 }
             }
         ]);
+        const ccTotal = ccResult.length > 0 ? ccResult[0].total : 0;
 
-        const totalAmount = result.length > 0 ? result[0].total : 0;
+        // 2. Calculate Total from Unified CashTransactions (Manual Costs)
+        // We need to unwind installments and match specific due date
+        const cashResult = await CashTransaction.aggregate([
+            {
+                $match: {
+                    tenantId,
+                    financialAccountId,
+                    paymentMethodId,
+                    isInvoice: false, // Don't sum the invoices themselves!
+                    // Optimization: Only look for docs that MIGHT have installments in this range
+                    // But standard match is safer
+                }
+            },
+            { $unwind: "$installments" },
+            {
+                $match: {
+                    "installments.dueDate": { $gte: startOfDay, $lte: endOfDay }
+                }
+            },
+            {
+                $group: {
+                    _id: null,
+                    total: { $sum: "$installments.amount" }
+                }
+            }
+        ]);
+        const cashTotal = cashResult.length > 0 ? cashResult[0].total : 0;
 
-        // 2. Find existing Invoice Record in CashTransaction
+        const totalAmount = ccTotal + cashTotal;
+
+        // 3. Find existing Invoice Record in CashTransaction
         const invoiceQuery = {
             tenantId,
             financialAccountId,
@@ -60,20 +89,19 @@ export const syncInvoiceRecord = async (tenantId, financialAccountId, paymentMet
                     description: `Fatura ${cardName}`,
                     amount: totalAmount,
                     type: TransactionType.EXPENSE,
-                    category: TransactionCategory.OTHER, // Or a specific 'INVOICE' category
-                    dueDate: startOfDay, // Normalize date
-                    timestamp: startOfDay, // Invoice competence is its due date usually
+                    category: TransactionCategory.OTHER, 
+                    dueDate: startOfDay, 
+                    timestamp: startOfDay, 
                     // Preserve status if it was already PAID, otherwise PENDING
                     $setOnInsert: { status: TransactionStatus.PENDING } 
                 },
                 { upsert: true, new: true }
             );
         } else {
-            // If total is 0, remove the invoice record (it's empty)
-            // But ONLY if it's pending. If paid, maybe keep it? Usually remove if empty.
+            // If total is 0, remove the invoice record if it's pending
             await CashTransaction.findOneAndDelete({
                 ...invoiceQuery,
-                status: TransactionStatus.PENDING // Only auto-delete if not paid
+                status: TransactionStatus.PENDING 
             });
         }
 
