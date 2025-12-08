@@ -106,7 +106,9 @@ const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymen
           const closingDay = methodRule.closingDay || 1;
           const dueDay = methodRule.dueDay || 10;
           
-          const competenceDate = new Date(purchaseOrder.createdAt);
+          // Use the provided Payment Date (Transaction Date) as the competence date, or fallback to creation date
+          const competenceDate = reqPaymentDate ? new Date(reqPaymentDate) : new Date(purchaseOrder.createdAt);
+          
           const pDay = competenceDate.getDate();
           let targetMonth = competenceDate.getMonth();
           let targetYear = competenceDate.getFullYear();
