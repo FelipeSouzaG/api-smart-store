@@ -29,11 +29,12 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
     return res.status(400).json({ message: 'Descrição, valor e categoria são obrigatórios.' });
   }
 
+  // Base date used for calculation (Purchase Date/Competence)
   const competenceDate = timestamp ? new Date(timestamp) : new Date();
 
   try {
-    // 1. Check for Credit Card Logic (Independent of status passed by frontend, though intent is Paid/Pending via CC)
-    if (financialAccountId && financialAccountId !== 'cash-box' && paymentMethodId) {
+    // 1. Credit Card Logic (Status PAID + Bank Credit Method)
+    if (financialAccountId && financialAccountId !== 'cash-box' && financialAccountId !== 'boleto' && paymentMethodId) {
         const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
         const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId || (m._id && m._id.toString() === paymentMethodId));
 
@@ -45,11 +46,14 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
             const closingDay = methodRule.closingDay || 1;
             const dueDay = methodRule.dueDay || 10;
 
-            const purchaseDay = competenceDate.getUTCDate();
-            let targetMonth = competenceDate.getUTCMonth();
-            let targetYear = competenceDate.getUTCFullYear();
+            // Use PaymentDate as the transaction date if provided (when Status is Paid), otherwise timestamp
+            const refDate = paymentDate ? new Date(paymentDate) : competenceDate;
+            
+            const pDay = refDate.getUTCDate();
+            let targetMonth = refDate.getUTCMonth();
+            let targetYear = refDate.getUTCFullYear();
 
-            if (purchaseDay >= closingDay) {
+            if (pDay >= closingDay) {
                 targetMonth += 1;
                 if (targetMonth > 11) { targetMonth = 0; targetYear += 1; }
             }
@@ -72,7 +76,7 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
                     description: instDesc,
                     amount: installmentValue,
                     category,
-                    timestamp: competenceDate,
+                    timestamp: refDate,
                     dueDate: autoDueDate,
                     financialAccountId,
                     paymentMethodId,
@@ -89,12 +93,43 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
                 await syncInvoiceRecord(req.tenantId, financialAccountId, paymentMethodId, new Date(dateStr));
             }
 
-            // Return early to prevent saving to CashTransaction
             return res.status(201).json({ message: "Lançado no cartão e faturas atualizadas." });
         }
     }
 
-    // 2. Default Behavior (Cash Box, Bank-Debit, Bank-Pix) -> CashTransaction
+    // 2. Boleto Split Logic (Status PENDING + Boleto Account)
+    if (financialAccountId === 'boleto' && status === TransactionStatus.PENDING) {
+        const numInstallments = installments && installments > 0 ? parseInt(installments) : 1;
+        
+        if (numInstallments > 1) {
+            const installmentValue = amount / numInstallments;
+            const baseDueDate = dueDate ? new Date(dueDate) : new Date();
+            const transactionsToAdd = [];
+
+            for (let i = 0; i < numInstallments; i++) {
+                const instDate = new Date(baseDueDate);
+                instDate.setMonth(baseDueDate.getMonth() + i);
+                
+                transactionsToAdd.push({
+                    tenantId: req.tenantId,
+                    description: `${description} (${i + 1}/${numInstallments})`,
+                    amount: installmentValue,
+                    type: TransactionType.EXPENSE,
+                    category,
+                    status: TransactionStatus.PENDING,
+                    timestamp: competenceDate,
+                    dueDate: instDate,
+                    financialAccountId: 'boleto',
+                    paymentMethodId: undefined
+                });
+            }
+            
+            const savedDocs = await CashTransaction.insertMany(transactionsToAdd);
+            return res.status(201).json(savedDocs[0]); // Return first as confirmation
+        }
+    }
+
+    // 3. Default Behavior (Cash Box, Bank-Debit, Bank-Pix, Single Boleto) -> CashTransaction
     const transaction = new CashTransaction({
         description,
         amount,
@@ -102,17 +137,13 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
         type: TransactionType.EXPENSE,
         tenantId: req.tenantId,
         timestamp: competenceDate,
-        financialAccountId: financialAccountId === 'cash-box' ? 'cash-box' : financialAccountId,
-        paymentMethodId: financialAccountId === 'cash-box' ? undefined : paymentMethodId,
+        financialAccountId: financialAccountId === 'boleto' ? 'boleto' : (financialAccountId === 'cash-box' ? 'cash-box' : financialAccountId),
+        paymentMethodId: (financialAccountId === 'cash-box' || financialAccountId === 'boleto') ? undefined : paymentMethodId,
         status: status,
         dueDate: dueDate ? new Date(dueDate) : undefined,
-        paymentDate: paymentDate ? new Date(paymentDate) : undefined
+        paymentDate: (status === TransactionStatus.PAID) ? (paymentDate ? new Date(paymentDate) : new Date()) : undefined
     });
     
-    if (transaction.status === TransactionStatus.PAID && !transaction.paymentDate) {
-        transaction.paymentDate = new Date();
-    }
-
     const newTransaction = await transaction.save();
     res.status(201).json(newTransaction);
 
@@ -183,7 +214,7 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
 
     // 2. Logic: Moving from Cash to Credit Card?
     // If the new update has credit card details, we must DELETE this CashTransaction and CREATE CreditCardTransactions.
-    if (financialAccountId && financialAccountId !== 'cash-box' && paymentMethodId) {
+    if (financialAccountId && financialAccountId !== 'cash-box' && financialAccountId !== 'boleto' && paymentMethodId) {
         const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
         const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId || (m._id && m._id.toString() === paymentMethodId));
 
@@ -198,11 +229,12 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
              const closingDay = methodRule.closingDay || 1;
              const dueDay = methodRule.dueDay || 10;
 
-             const purchaseDay = competenceDate.getUTCDate();
-             let targetMonth = competenceDate.getUTCMonth();
-             let targetYear = competenceDate.getUTCFullYear();
+             const refDate = otherData.paymentDate ? new Date(otherData.paymentDate) : competenceDate;
+             const pDay = refDate.getUTCDate();
+             let targetMonth = refDate.getUTCMonth();
+             let targetYear = refDate.getUTCFullYear();
 
-             if (purchaseDay >= closingDay) {
+             if (pDay >= closingDay) {
                  targetMonth += 1;
                  if (targetMonth > 11) { targetMonth = 0; targetYear += 1; }
              }
@@ -225,7 +257,7 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
                      description: instDesc,
                      amount: installmentValue,
                      category,
-                     timestamp: competenceDate,
+                     timestamp: refDate,
                      dueDate: autoDueDate,
                      financialAccountId,
                      paymentMethodId,
@@ -286,3 +318,4 @@ router.delete('/:id', protect, authorize('owner', 'manager'), async (req, res) =
 });
 
 export default router;
+
