@@ -199,170 +199,187 @@ router.post('/pay-invoice', protect, authorize('owner', 'manager'), async (req, 
     }
 });
 
-// PUT (update) a transaction
+// PUT (update) a transaction using DELETE -> CREATE pattern
 router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
-  const { tenantId, description, amount, category, financialAccountId, paymentMethodId, installments, timestamp, status, installmentNumber, ...otherData } = req.body;
+  const { tenantId: _tid, description, amount, category, financialAccountId, paymentMethodId, installments, timestamp, status, dueDate, paymentDate, ...otherData } = req.body;
+  
+  // Use passed timestamp or keep original logic (defaults to now if missing)
   const competenceDate = timestamp ? new Date(timestamp) : new Date();
 
   try {
-    // 1. Check if it's an update to a SPECIFIC INSTALLMENT within a split cost (Manual Cost with Array)
-    if (installmentNumber !== undefined) {
-        // Must be a valid ID to find the parent doc
-        if (mongoose.Types.ObjectId.isValid(req.params.id)) {
-            const doc = await CashTransaction.findOne({ _id: req.params.id, tenantId: req.tenantId });
+    const targetId = req.params.id;
+
+    // --- PHASE 1: DELETE OLD RECORD(S) ---
+    let deletedSomething = false;
+
+    // Check 1: Is it a CashTransaction (ObjectId)?
+    if (mongoose.Types.ObjectId.isValid(targetId)) {
+        const cashT = await CashTransaction.findOne({ _id: targetId, tenantId: req.tenantId });
+        if (cashT) {
+            if(cashT.isInvoice) return res.status(403).json({ message: "Edite as compras individuais da fatura." });
             
-            // Scenario A: It's a Manual Cost with 'installments' array
-            if (doc && doc.installments && doc.installments.length > 0) {
-                const sub = doc.installments.find(i => i.number === installmentNumber);
-                if (sub) {
-                    sub.status = status;
-                    if (status === TransactionStatus.PAID) {
-                        sub.paymentDate = otherData.paymentDate ? new Date(otherData.paymentDate) : new Date();
-                    } else {
-                        sub.paymentDate = null;
-                    }
-                    
-                    const allPaid = doc.installments.every(i => i.status === TransactionStatus.PAID);
-                    if (allPaid) doc.status = TransactionStatus.PAID;
-                    else doc.status = TransactionStatus.PENDING;
-                    
-                    await doc.save();
-                    return res.json(doc);
-                }
+            // Check specific installment update vs Full update
+            // If installmentNumber is present in body, we might just be updating a sub-status.
+            // However, "Delete-Create" is requested for FULL edits (changing type/values).
+            // We assume Cost Modal sends a full payload.
+            
+            await CashTransaction.deleteOne({ _id: targetId });
+            deletedSomething = true;
+            
+            // Sync Reverse Logic (if it was linked)
+            if (cashT.purchaseId) await updateOriginStatus(req.tenantId, 'purchase', cashT.purchaseId);
+        }
+    }
+
+    // Check 2: Is it a CreditCardTransaction group (Reference ID)?
+    // Or if we didn't find it in Cash, maybe it was a CC Ref passed as ID
+    if (!deletedSomething) {
+        // If ID starts with COST- or is just a string ref
+        const ccTrans = await CreditCardTransaction.find({ referenceId: targetId, tenantId: req.tenantId });
+        
+        if (ccTrans.length > 0) {
+            if (ccTrans[0].source !== 'manual') return res.status(403).json({ message: "Edite a Compra ou OS de origem." });
+
+            const affectedInvoices = new Set();
+            ccTrans.forEach(t => affectedInvoices.add(JSON.stringify({ acc: t.financialAccountId, met: t.paymentMethodId, due: t.dueDate })));
+
+            await CreditCardTransaction.deleteMany({ referenceId: targetId, tenantId: req.tenantId });
+            deletedSomething = true;
+
+            // Recalculate invoices
+            for (const invStr of affectedInvoices) {
+                const inv = JSON.parse(invStr);
+                await syncInvoiceRecord(req.tenantId, inv.acc, inv.met, new Date(inv.due));
             }
         }
     }
 
-    // 2. Standard Update (Single Record or Purchase Installment Record)
-    // Only query CashTransaction if the ID is a valid ObjectId to prevent CastErrors
-    let existingCash = null;
-    if (mongoose.Types.ObjectId.isValid(req.params.id)) {
-        existingCash = await CashTransaction.findOne({ _id: req.params.id, tenantId: req.tenantId });
-    }
-    
-    if (existingCash) {
-         if(existingCash.isInvoice) return res.status(403).json({ message: "Edite as compras individuais da fatura." });
-         
-         // Logic to Handle Transition from Split (Pending Boleto) to Single (Paid Cash)
-         // If installments (input) is 1 or missing, and we are updating status, wipe the array.
-         const inputInstallments = parseInt(installments || '1');
-         if (inputInstallments === 1 && existingCash.installments && existingCash.installments.length > 0) {
-             existingCash.installments = []; // Clear sub-installments to make it a single record
-         }
-
-         // Simple Status/Date Update
-         existingCash.status = status || existingCash.status;
-         if (existingCash.status === TransactionStatus.PAID) {
-             existingCash.paymentDate = otherData.paymentDate ? new Date(otherData.paymentDate) : new Date();
-         } else {
-             existingCash.paymentDate = undefined;
-         }
-         
-         // Robust Due Date Handling
-         if (req.body.dueDate) {
-             existingCash.dueDate = new Date(req.body.dueDate);
-         } else if (existingCash.status === TransactionStatus.PAID && otherData.paymentDate) {
-             // Fallback: If paid, dueDate matches payment date to prevent validation errors
-             existingCash.dueDate = new Date(otherData.paymentDate);
-         }
-         
-         if (description) existingCash.description = description;
-         if (amount) existingCash.amount = amount;
-         if (financialAccountId) existingCash.financialAccountId = financialAccountId; // Ensure account updates too
-
-         await existingCash.save();
-
-         // --- SYNC REVERSO ---
-         if (existingCash.purchaseId) {
-             await updateOriginStatus(req.tenantId, 'purchase', existingCash.purchaseId);
-         }
-         
-         return res.json(existingCash);
-    } 
-    
-    // Credit Card Update Logic (Grouped by ReferenceID) ...
-    // Treat as String Reference ID (e.g. COST-123...)
-    const isRef = req.params.id.startsWith('COST-');
-    const ccQuery = isRef 
-        ? { referenceId: req.params.id, tenantId: req.tenantId }
-        : { _id: mongoose.Types.ObjectId.isValid(req.params.id) ? req.params.id : null, tenantId: req.tenantId }; // Safe check
-
-    // Prevent searching with null if ID was invalid for CC too
-    if (!isRef && !ccQuery._id) {
-         return res.status(404).json({ message: 'Lançamento não encontrado (ID Inválido).' });
+    if (!deletedSomething) {
+        return res.status(404).json({ message: "Lançamento não encontrado para edição." });
     }
 
-    const existingCC = await CreditCardTransaction.findOne(ccQuery);
+    // --- PHASE 2: CREATE NEW RECORD(S) ---
+    // Logic mirrored from POST to ensure consistency based on NEW payload
 
-    if (existingCC) {
-        if (existingCC.source !== 'manual') return res.status(403).json({ message: "Edite a Compra ou OS de origem." });
-        
-        // Find ALL items in this group to sync invoices properly
-        const allInGroup = await CreditCardTransaction.find(ccQuery);
-        const affectedInvoices = new Set();
-        allInGroup.forEach(t => affectedInvoices.add(JSON.stringify({ acc: t.financialAccountId, met: t.paymentMethodId, due: t.dueDate })));
+    // A. Credit Card Logic
+    if (financialAccountId && financialAccountId !== 'cash-box' && financialAccountId !== 'boleto' && paymentMethodId) {
+        const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
+        const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId || (m._id && m._id.toString() === paymentMethodId));
 
-        // Delete group
-        await CreditCardTransaction.deleteMany(ccQuery);
-        
-        // Sync affected invoices (Clearing old)
-        for (const invStr of affectedInvoices) {
-            const inv = JSON.parse(invStr);
-            await syncInvoiceRecord(req.tenantId, inv.acc, inv.met, new Date(inv.due));
+        if (methodRule && methodRule.type === 'Credit') {
+            const numInstallments = installments && installments > 0 ? parseInt(installments) : 1;
+            const installmentValue = amount / numInstallments;
+            const referenceId = `COST-${Date.now()}-${Math.floor(Math.random() * 10000)}`; 
+
+            const closingDay = methodRule.closingDay || 1;
+            const dueDay = methodRule.dueDay || 10;
+
+            const refDate = paymentDate ? new Date(paymentDate) : competenceDate;
+            const pDay = refDate.getUTCDate();
+            let targetMonth = refDate.getUTCMonth();
+            let targetYear = refDate.getUTCFullYear();
+
+            if (pDay >= closingDay) {
+                targetMonth += 1;
+                if (targetMonth > 11) { targetMonth = 0; targetYear += 1; }
+            }
+
+            const ccTransactions = [];
+            const affectedDueDates = new Set();
+
+            for (let i = 0; i < numInstallments; i++) {
+                let currentInstMonth = targetMonth + i;
+                let currentInstYear = targetYear;
+                while (currentInstMonth > 11) { currentInstMonth -= 12; currentInstYear += 1; }
+                
+                const autoDueDate = new Date(Date.UTC(currentInstYear, currentInstMonth, dueDay, 12, 0, 0));
+                affectedDueDates.add(autoDueDate.toISOString());
+
+                const instDesc = numInstallments > 1 ? `${description} (${i + 1}/${numInstallments})` : description;
+
+                ccTransactions.push({
+                    tenantId: req.tenantId,
+                    description: instDesc,
+                    amount: installmentValue,
+                    category,
+                    timestamp: refDate,
+                    dueDate: autoDueDate,
+                    financialAccountId,
+                    paymentMethodId,
+                    installmentNumber: i + 1,
+                    totalInstallments: numInstallments,
+                    source: 'manual',
+                    referenceId
+                });
+            }
+
+            await CreditCardTransaction.insertMany(ccTransactions);
+
+            for (const dateStr of affectedDueDates) {
+                await syncInvoiceRecord(req.tenantId, financialAccountId, paymentMethodId, new Date(dateStr));
+            }
+
+            return res.json({ message: "Atualizado para Cartão de Crédito." });
+        }
+    }
+
+    // B. Split Payment Logic (Boleto or Manual Installments)
+    const numInstallments = installments && installments > 0 ? parseInt(installments) : 1;
+    const isSplit = numInstallments > 1;
+
+    if (isSplit) {
+        const installmentValue = amount / numInstallments;
+        const baseDueDate = dueDate ? new Date(dueDate) : new Date();
+        const installmentsArray = [];
+
+        for (let i = 0; i < numInstallments; i++) {
+            const instDate = new Date(baseDueDate);
+            instDate.setMonth(baseDueDate.getMonth() + i);
+            
+            installmentsArray.push({
+                number: i + 1,
+                amount: installmentValue,
+                dueDate: instDate,
+                status: TransactionStatus.PENDING,
+                paymentDate: null
+            });
         }
         
-        // Re-create as Credit Logic (Same as POST)
-        if (financialAccountId && financialAccountId !== 'cash-box' && financialAccountId !== 'boleto' && paymentMethodId) {
-             const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
-             const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId || (m._id && m._id.toString() === paymentMethodId));
-             if (methodRule && methodRule.type === 'Credit') {
-                 // RE-CREATE CREDIT (Update parameters)
-                 const referenceId = `COST-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-                 const numInstallments = installments || 1;
-                 const installmentValue = amount / numInstallments;
-                 const closingDay = methodRule.closingDay || 1;
-                 const dueDay = methodRule.dueDay || 10;
-                 const refDate = otherData.paymentDate ? new Date(otherData.paymentDate) : competenceDate;
-                 const pDay = refDate.getUTCDate();
-                 let targetMonth = refDate.getUTCMonth();
-                 let targetYear = refDate.getUTCFullYear();
-                 if (pDay >= closingDay) { targetMonth += 1; if (targetMonth > 11) { targetMonth = 0; targetYear += 1; } }
-                 
-                 const ccTransactions = [];
-                 const affectedDueDates = new Set();
-                 for (let i = 0; i < numInstallments; i++) {
-                     let m = targetMonth + i;
-                     let y = targetYear;
-                     while(m > 11) { m -= 12; y += 1; }
-                     const autoDue = new Date(Date.UTC(y, m, dueDay, 12, 0, 0));
-                     affectedDueDates.add(autoDue.toISOString());
-                     ccTransactions.push({
-                         tenantId: req.tenantId, description: numInstallments > 1 ? `${description} (${i + 1}/${numInstallments})` : description,
-                         amount: installmentValue, category, timestamp: refDate, dueDate: autoDue,
-                         financialAccountId, paymentMethodId, installmentNumber: i + 1, totalInstallments: numInstallments, source: 'manual',
-                         referenceId
-                     });
-                 }
-                 await CreditCardTransaction.insertMany(ccTransactions);
-                 for (const d of affectedDueDates) await syncInvoiceRecord(req.tenantId, financialAccountId, paymentMethodId, new Date(d));
-                 return res.json({ message: "Atualizado." });
-             }
-        }
-
-        // Fallback: Create Cash Transaction if switched from Credit to Cash
-        const newT = new CashTransaction({
-            tenantId: req.tenantId, description, amount, category, type: TransactionType.EXPENSE,
-            timestamp: competenceDate, status,
+        const transaction = new CashTransaction({
+            tenantId: req.tenantId,
+            description, 
+            amount, 
+            type: TransactionType.EXPENSE,
+            category,
+            status: TransactionStatus.PENDING, 
+            timestamp: competenceDate,
+            dueDate: baseDueDate,
             financialAccountId: financialAccountId === 'boleto' ? 'boleto' : (financialAccountId || 'cash-box'),
             paymentMethodId: (financialAccountId === 'cash-box' || financialAccountId === 'boleto') ? undefined : paymentMethodId,
-            dueDate: otherData.dueDate ? new Date(otherData.dueDate) : undefined,
-            paymentDate: status === TransactionStatus.PAID ? (otherData.paymentDate ? new Date(otherData.paymentDate) : new Date()) : undefined
-         });
-         await newT.save();
-         return res.json(newT);
+            installments: installmentsArray
+        });
+        
+        const newTransaction = await transaction.save();
+        return res.json(newTransaction);
     }
 
-    return res.status(404).json({ message: 'Lançamento não encontrado.' });
+    // C. Default Single Transaction
+    const transaction = new CashTransaction({
+        description,
+        amount,
+        category,
+        type: TransactionType.EXPENSE,
+        tenantId: req.tenantId,
+        timestamp: competenceDate,
+        financialAccountId: financialAccountId === 'boleto' ? 'boleto' : (financialAccountId === 'cash-box' ? 'cash-box' : financialAccountId),
+        paymentMethodId: (financialAccountId === 'cash-box' || financialAccountId === 'boleto') ? undefined : paymentMethodId,
+        status: status,
+        dueDate: dueDate ? new Date(dueDate) : undefined,
+        paymentDate: (status === TransactionStatus.PAID) ? (paymentDate ? new Date(paymentDate) : new Date()) : undefined
+    });
+    
+    const newTransaction = await transaction.save();
+    return res.json(newTransaction);
 
   } catch (err) {
     console.error("Update Transaction Error:", err);
