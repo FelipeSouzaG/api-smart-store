@@ -22,6 +22,7 @@ router.get('/', protect, authorize('owner', 'manager'), async (req, res) => {
 
 // POST a new transaction (for manual costs)
 router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
+  console.log("POST /transactions - Body:", req.body); // DEBUG
   const { description, amount, category, paymentMethodId, installments, financialAccountId, timestamp, dueDate, paymentDate, status } = req.body;
   
   if (!description || !amount || !category) {
@@ -38,9 +39,10 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
         const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId || (m._id && m._id.toString() === paymentMethodId));
 
         if (methodRule && methodRule.type === 'Credit') {
+            console.log("-> Processing as Credit Card Transaction"); // DEBUG
             const numInstallments = installments && installments > 0 ? parseInt(installments) : 1;
             const installmentValue = amount / numInstallments;
-            const referenceId = `COST-${Date.now()}-${Math.floor(Math.random() * 10000)}`; // Grouping ID for Manual Costs
+            const referenceId = `COST-${Date.now()}-${Math.floor(Math.random() * 10000)}`; 
 
             const closingDay = methodRule.closingDay || 1;
             const dueDay = methodRule.dueDay || 10;
@@ -99,6 +101,7 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
     const isSplit = numInstallments > 1;
 
     if (isSplit) {
+        console.log(`-> Processing as Split Cash Transaction (${numInstallments}x)`); // DEBUG
         const installmentValue = amount / numInstallments;
         const baseDueDate = dueDate ? new Date(dueDate) : new Date();
         const installmentsArray = [];
@@ -131,10 +134,12 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
         });
         
         const newTransaction = await transaction.save();
+        console.log("-> Saved Split Transaction ID:", newTransaction._id); // DEBUG
         return res.status(201).json(newTransaction);
     }
 
     // 3. Default Single Transaction
+    console.log("-> Processing as Single Cash Transaction"); // DEBUG
     const transaction = new CashTransaction({
         description,
         amount,
@@ -150,6 +155,7 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
     });
     
     const newTransaction = await transaction.save();
+    console.log("-> Saved Single Transaction ID:", newTransaction._id); // DEBUG
     res.status(201).json(newTransaction);
 
   } catch (err) {
@@ -227,10 +233,6 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
                 return res.json(doc);
             }
         }
-        
-        // Scenario B: It's a Purchase/OS individual installment (Legacy or Standard Purchase)
-        // If 'installmentNumber' is passed but doc.installments is empty, it might be an individual record that thinks it's part of a set?
-        // Actually, individual purchase records behave like normal records below.
     }
 
     // 2. Standard Update (Single Record or Purchase Installment Record)
@@ -239,17 +241,8 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
     if (existingCash) {
          if(existingCash.isInvoice) return res.status(403).json({ message: "Edite as compras individuais da fatura." });
          
-         // If changing fundamental type (e.g. Cash -> Credit), we delete and recreate
-         // But if just changing Status/Date, we update in place
          const typeChanged = (financialAccountId && financialAccountId !== existingCash.financialAccountId) || 
                              (paymentMethodId && paymentMethodId !== existingCash.paymentMethodId);
-
-         if (typeChanged && financialAccountId && financialAccountId !== 'cash-box' && financialAccountId !== 'boleto') {
-             // ... [Complex Logic for Type Change - Skipped for brevity, assume Status Update mostly] ...
-             // If creating credit card from cash, delete and insert CC.
-             // This existing block handles that conversion.
-             // ...
-         }
 
          // Simple Status/Date Update
          existingCash.status = status || existingCash.status;
@@ -274,7 +267,80 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
     } 
     
     // Credit Card Update Logic (Grouped by ReferenceID) ...
-    // ... [Existing code] ...
+    const isRef = req.params.id.startsWith('COST-');
+    const ccQuery = isRef 
+        ? { referenceId: req.params.id, tenantId: req.tenantId }
+        : { _id: req.params.id, tenantId: req.tenantId };
+
+    const existingCC = await CreditCardTransaction.findOne(ccQuery);
+
+    if (existingCC) {
+        if (existingCC.source !== 'manual') return res.status(403).json({ message: "Edite a Compra ou OS de origem." });
+        
+        // Find ALL items in this group to sync invoices properly
+        const allInGroup = await CreditCardTransaction.find(ccQuery);
+        const affectedInvoices = new Set();
+        allInGroup.forEach(t => affectedInvoices.add(JSON.stringify({ acc: t.financialAccountId, met: t.paymentMethodId, due: t.dueDate })));
+
+        // Delete group
+        await CreditCardTransaction.deleteMany(ccQuery);
+        
+        // Sync affected invoices (Clearing old)
+        for (const invStr of affectedInvoices) {
+            const inv = JSON.parse(invStr);
+            await syncInvoiceRecord(req.tenantId, inv.acc, inv.met, new Date(inv.due));
+        }
+        
+        // Re-create as Credit Logic (Same as POST)
+        if (financialAccountId && financialAccountId !== 'cash-box' && financialAccountId !== 'boleto' && paymentMethodId) {
+             const account = await FinancialAccount.findOne({ _id: financialAccountId, tenantId: req.tenantId });
+             const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId || (m._id && m._id.toString() === paymentMethodId));
+             if (methodRule && methodRule.type === 'Credit') {
+                 // RE-CREATE CREDIT (Update parameters)
+                 const referenceId = `COST-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+                 const numInstallments = installments || 1;
+                 const installmentValue = amount / numInstallments;
+                 const closingDay = methodRule.closingDay || 1;
+                 const dueDay = methodRule.dueDay || 10;
+                 const refDate = otherData.paymentDate ? new Date(otherData.paymentDate) : competenceDate;
+                 const pDay = refDate.getUTCDate();
+                 let targetMonth = refDate.getUTCMonth();
+                 let targetYear = refDate.getUTCFullYear();
+                 if (pDay >= closingDay) { targetMonth += 1; if (targetMonth > 11) { targetMonth = 0; targetYear += 1; } }
+                 
+                 const ccTransactions = [];
+                 const affectedDueDates = new Set();
+                 for (let i = 0; i < numInstallments; i++) {
+                     let m = targetMonth + i;
+                     let y = targetYear;
+                     while(m > 11) { m -= 12; y += 1; }
+                     const autoDue = new Date(Date.UTC(y, m, dueDay, 12, 0, 0));
+                     affectedDueDates.add(autoDue.toISOString());
+                     ccTransactions.push({
+                         tenantId: req.tenantId, description: numInstallments > 1 ? `${description} (${i + 1}/${numInstallments})` : description,
+                         amount: installmentValue, category, timestamp: refDate, dueDate: autoDue,
+                         financialAccountId, paymentMethodId, installmentNumber: i + 1, totalInstallments: numInstallments, source: 'manual',
+                         referenceId
+                     });
+                 }
+                 await CreditCardTransaction.insertMany(ccTransactions);
+                 for (const d of affectedDueDates) await syncInvoiceRecord(req.tenantId, financialAccountId, paymentMethodId, new Date(d));
+                 return res.json({ message: "Atualizado." });
+             }
+        }
+
+        // Fallback: Create Cash Transaction if switched from Credit to Cash
+        const newT = new CashTransaction({
+            tenantId: req.tenantId, description, amount, category, type: TransactionType.EXPENSE,
+            timestamp: competenceDate, status,
+            financialAccountId: financialAccountId === 'boleto' ? 'boleto' : (financialAccountId || 'cash-box'),
+            paymentMethodId: (financialAccountId === 'cash-box' || financialAccountId === 'boleto') ? undefined : paymentMethodId,
+            dueDate: otherData.dueDate ? new Date(otherData.dueDate) : undefined,
+            paymentDate: status === TransactionStatus.PAID ? (otherData.paymentDate ? new Date(otherData.paymentDate) : new Date()) : undefined
+         });
+         await newT.save();
+         return res.json(newT);
+    }
 
     return res.status(404).json({ message: 'Lançamento não encontrado.' });
 
@@ -306,7 +372,31 @@ router.delete('/:id', protect, authorize('owner', 'manager'), async (req, res) =
     }
 
     // Credit Card Delete Logic
-    // ... [Existing code] ...
+    const isRef = req.params.id.startsWith('COST-');
+    const ccQuery = isRef 
+        ? { referenceId: req.params.id, tenantId: req.tenantId }
+        : { _id: req.params.id, tenantId: req.tenantId };
+
+    const ccTransaction = await CreditCardTransaction.findOne(ccQuery);
+    
+    if (ccTransaction) {
+        if (ccTransaction.source !== 'manual') {
+             return res.status(403).json({ message: "Este lançamento está vinculado a uma Compra ou OS. Exclua o registro de origem." });
+        }
+        
+        const allInGroup = await CreditCardTransaction.find(ccQuery);
+        const affectedInvoices = new Set();
+        allInGroup.forEach(t => affectedInvoices.add(JSON.stringify({ acc: t.financialAccountId, met: t.paymentMethodId, due: t.dueDate })));
+
+        await CreditCardTransaction.deleteMany(ccQuery);
+        
+        for (const invStr of affectedInvoices) {
+            const inv = JSON.parse(invStr);
+            await syncInvoiceRecord(req.tenantId, inv.acc, inv.met, new Date(inv.due));
+        }
+
+        return res.json({ message: 'Credit card cost deleted successfully' });
+    }
     
     return res.status(404).json({ message: 'Not found' });
 
