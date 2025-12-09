@@ -88,49 +88,43 @@ export const updateOriginStatus = async (tenantId, originType, originId) => {
 
         const transactions = await CashTransaction.find(query);
         
-        // Se não houver transações (ex: tudo deletado ou pago via cartão que não gera cash individual imediato), 
-        // talvez não devamos alterar, mas se for boleto, verificamos.
+        // Se não houver transações (ex: tudo deletado), não fazemos nada ou poderíamos marcar como pendente/cancelado
+        // Mas para compras, se não há transações no caixa, pode ser que seja Cartão de Crédito (tabela separada).
         if (transactions.length === 0) return;
 
         // 2. Verificar Status Geral
+        // Se TODAS as transações vinculadas estiverem PAGAS, a origem é PAGA.
+        // Se UMA estiver PENDENTE (Reaberta), a origem volta a ser PENDENTE.
         const allPaid = transactions.every(t => t.status === TransactionStatus.PAID);
-        const newStatus = allPaid ? TransactionStatus.PAID : TransactionStatus.PENDING;
 
         // 3. Atualizar a Origem
         if (originType === 'purchase') {
             const purchase = await PurchaseOrder.findOne({ _id: originId, tenantId });
             if (purchase) {
-                // Atualiza status do cabeçalho
-                // Mapeia TransactionStatus para o status usado em Purchase (que usa os mesmos enums ou string)
-                // Se a compra foi via Cartão, ela já nasce Paga na origem geralmente, 
-                // mas se foi Boleto, essa sincronia é vital.
+                // Ignorar compras via Cartão de Crédito (pois o status delas é gerido pela fatura/compra inicial)
+                // Focamos em sincronizar Boleto, Caixa e Bancos (Débito/Pix/Transf)
+                const isCredit = ['Cartão de Crédito', 'Crédito à Vista', 'Crédito Parcelado'].includes(purchase.paymentDetails.method);
                 
-                // Só atualizamos se houver mudança para evitar loops ou overwrites desnecessários
-                // E preservamos dados de cartão se existirem
-                if (purchase.paymentDetails.method !== 'Cartão de Crédito' && 
-                    purchase.paymentDetails.method !== 'Crédito Parcelado' && 
-                    purchase.paymentDetails.method !== 'Crédito à Vista') {
-                        
-                    // Atualiza status dentro de paymentDetails (campo virtual ou paymentDate se pago)
-                    if (allPaid && !purchase.paymentDetails.paymentDate) {
-                        purchase.paymentDetails.paymentDate = new Date(); // Marca data de hoje como quitação
-                        // Em algumas implementações o status fica solto no objeto, vamos garantir consistência se houver campo status
-                    } else if (!allPaid) {
+                if (!isCredit) {
+                    if (allPaid) {
+                        // Se tudo pago, define data de pagamento (Status: Pago)
+                        if (!purchase.paymentDetails.paymentDate) {
+                            purchase.paymentDetails.paymentDate = new Date();
+                        }
+                    } else {
+                        // Se algo pendente (ex: reabriu no caixa), limpa data (Status: Pendente)
                         purchase.paymentDetails.paymentDate = null;
                     }
                     
-                    // Se você tiver um campo de status explícito na raiz do PurchaseOrder, atualize-o aqui
-                    // Exemplo hipotético se existisse purchase.status = newStatus;
+                    // Força atualização do subdocumento pois Mongoose as vezes não detecta mudanças profundas
+                    purchase.markModified('paymentDetails');
                     await purchase.save();
                 }
             }
         } else if (originType === 'service_order') {
-            // OS tem lógica mais complexa (Completed vs Pending), mas o financeiro refere-se ao CUSTO da OS ou RECEITA?
-            // CashTransaction com serviceOrderId pode ser RECEITA (pagamento do cliente) ou DESPESA (peça).
-            // A função updateOriginStatus deve saber o que está atualizando.
-            // Geralmente, alterar o status de pagamento da Receita da OS não reabre a OS (status operacional), 
-            // mas define se ela está "Quitada".
-            // Para este sistema, focamos na consistência financeira.
+            // Lógica para OS (se necessário no futuro)
+            // Geralmente OS concluída não volta a pendente só por causa do financeiro, 
+            // mas o financeiro reflete se o valor foi recebido ou não.
         }
 
     } catch (error) {
