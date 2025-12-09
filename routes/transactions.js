@@ -1,5 +1,6 @@
 
 import express from 'express';
+import mongoose from 'mongoose'; // Import mongoose for validation
 const router = express.Router();
 import CashTransaction from '../models/CashTransaction.js';
 import CreditCardTransaction from '../models/CreditCardTransaction.js';
@@ -22,7 +23,6 @@ router.get('/', protect, authorize('owner', 'manager'), async (req, res) => {
 
 // POST a new transaction (for manual costs)
 router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
-  console.log("POST /transactions - Body:", req.body); // DEBUG
   const { description, amount, category, paymentMethodId, installments, financialAccountId, timestamp, dueDate, paymentDate, status } = req.body;
   
   if (!description || !amount || !category) {
@@ -39,7 +39,6 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
         const methodRule = account?.paymentMethods.find(m => m.id === paymentMethodId || (m._id && m._id.toString() === paymentMethodId));
 
         if (methodRule && methodRule.type === 'Credit') {
-            console.log("-> Processing as Credit Card Transaction"); // DEBUG
             const numInstallments = installments && installments > 0 ? parseInt(installments) : 1;
             const installmentValue = amount / numInstallments;
             const referenceId = `COST-${Date.now()}-${Math.floor(Math.random() * 10000)}`; 
@@ -101,7 +100,6 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
     const isSplit = numInstallments > 1;
 
     if (isSplit) {
-        console.log(`-> Processing as Split Cash Transaction (${numInstallments}x)`); // DEBUG
         const installmentValue = amount / numInstallments;
         const baseDueDate = dueDate ? new Date(dueDate) : new Date();
         const installmentsArray = [];
@@ -134,12 +132,10 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
         });
         
         const newTransaction = await transaction.save();
-        console.log("-> Saved Split Transaction ID:", newTransaction._id); // DEBUG
         return res.status(201).json(newTransaction);
     }
 
     // 3. Default Single Transaction
-    console.log("-> Processing as Single Cash Transaction"); // DEBUG
     const transaction = new CashTransaction({
         description,
         amount,
@@ -155,7 +151,6 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
     });
     
     const newTransaction = await transaction.save();
-    console.log("-> Saved Single Transaction ID:", newTransaction._id); // DEBUG
     res.status(201).json(newTransaction);
 
   } catch (err) {
@@ -212,38 +207,42 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
   try {
     // 1. Check if it's an update to a SPECIFIC INSTALLMENT within a split cost (Manual Cost with Array)
     if (installmentNumber !== undefined) {
-        const doc = await CashTransaction.findOne({ _id: req.params.id, tenantId: req.tenantId });
-        
-        // Scenario A: It's a Manual Cost with 'installments' array
-        if (doc && doc.installments && doc.installments.length > 0) {
-            const sub = doc.installments.find(i => i.number === installmentNumber);
-            if (sub) {
-                sub.status = status;
-                if (status === TransactionStatus.PAID) {
-                    sub.paymentDate = otherData.paymentDate ? new Date(otherData.paymentDate) : new Date();
-                } else {
-                    sub.paymentDate = null;
+        // Must be a valid ID to find the parent doc
+        if (mongoose.Types.ObjectId.isValid(req.params.id)) {
+            const doc = await CashTransaction.findOne({ _id: req.params.id, tenantId: req.tenantId });
+            
+            // Scenario A: It's a Manual Cost with 'installments' array
+            if (doc && doc.installments && doc.installments.length > 0) {
+                const sub = doc.installments.find(i => i.number === installmentNumber);
+                if (sub) {
+                    sub.status = status;
+                    if (status === TransactionStatus.PAID) {
+                        sub.paymentDate = otherData.paymentDate ? new Date(otherData.paymentDate) : new Date();
+                    } else {
+                        sub.paymentDate = null;
+                    }
+                    
+                    const allPaid = doc.installments.every(i => i.status === TransactionStatus.PAID);
+                    if (allPaid) doc.status = TransactionStatus.PAID;
+                    else doc.status = TransactionStatus.PENDING;
+                    
+                    await doc.save();
+                    return res.json(doc);
                 }
-                
-                const allPaid = doc.installments.every(i => i.status === TransactionStatus.PAID);
-                if (allPaid) doc.status = TransactionStatus.PAID;
-                else doc.status = TransactionStatus.PENDING;
-                
-                await doc.save();
-                return res.json(doc);
             }
         }
     }
 
     // 2. Standard Update (Single Record or Purchase Installment Record)
-    const existingCash = await CashTransaction.findOne({ _id: req.params.id, tenantId: req.tenantId });
+    // Only query CashTransaction if the ID is a valid ObjectId to prevent CastErrors
+    let existingCash = null;
+    if (mongoose.Types.ObjectId.isValid(req.params.id)) {
+        existingCash = await CashTransaction.findOne({ _id: req.params.id, tenantId: req.tenantId });
+    }
     
     if (existingCash) {
          if(existingCash.isInvoice) return res.status(403).json({ message: "Edite as compras individuais da fatura." });
          
-         const typeChanged = (financialAccountId && financialAccountId !== existingCash.financialAccountId) || 
-                             (paymentMethodId && paymentMethodId !== existingCash.paymentMethodId);
-
          // Simple Status/Date Update
          existingCash.status = status || existingCash.status;
          if (existingCash.status === TransactionStatus.PAID) {
@@ -267,10 +266,16 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
     } 
     
     // Credit Card Update Logic (Grouped by ReferenceID) ...
+    // Treat as String Reference ID (e.g. COST-123...)
     const isRef = req.params.id.startsWith('COST-');
     const ccQuery = isRef 
         ? { referenceId: req.params.id, tenantId: req.tenantId }
-        : { _id: req.params.id, tenantId: req.tenantId };
+        : { _id: mongoose.Types.ObjectId.isValid(req.params.id) ? req.params.id : null, tenantId: req.tenantId }; // Safe check
+
+    // Prevent searching with null if ID was invalid for CC too
+    if (!isRef && !ccQuery._id) {
+         return res.status(404).json({ message: 'Lançamento não encontrado (ID Inválido).' });
+    }
 
     const existingCC = await CreditCardTransaction.findOne(ccQuery);
 
@@ -353,29 +358,34 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
 // DELETE a transaction
 router.delete('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
   try {
-    const transaction = await CashTransaction.findOne({ _id: req.params.id, tenantId: req.tenantId });
-    if (transaction) {
-        if(transaction.isInvoice) {
-            return res.status(403).json({ message: "Não é possível excluir uma fatura consolidada." });
+    // Only look in CashTransaction if it's a valid ObjectId
+    if (mongoose.Types.ObjectId.isValid(req.params.id)) {
+        const transaction = await CashTransaction.findOne({ _id: req.params.id, tenantId: req.tenantId });
+        if (transaction) {
+            if(transaction.isInvoice) {
+                return res.status(403).json({ message: "Não é possível excluir uma fatura consolidada." });
+            }
+            
+            const purchaseId = transaction.purchaseId;
+            const serviceOrderId = transaction.serviceOrderId;
+
+            await CashTransaction.deleteOne({ _id: req.params.id });
+            
+            // Sync Reverse
+            if (purchaseId) await updateOriginStatus(req.tenantId, 'purchase', purchaseId);
+            if (serviceOrderId) await updateOriginStatus(req.tenantId, 'service_order', serviceOrderId);
+
+            return res.json({ message: 'Transaction deleted successfully' });
         }
-        
-        const purchaseId = transaction.purchaseId;
-        const serviceOrderId = transaction.serviceOrderId;
-
-        await CashTransaction.deleteOne({ _id: req.params.id });
-        
-        // Sync Reverse
-        if (purchaseId) await updateOriginStatus(req.tenantId, 'purchase', purchaseId);
-        if (serviceOrderId) await updateOriginStatus(req.tenantId, 'service_order', serviceOrderId);
-
-        return res.json({ message: 'Transaction deleted successfully' });
     }
 
     // Credit Card Delete Logic
     const isRef = req.params.id.startsWith('COST-');
     const ccQuery = isRef 
         ? { referenceId: req.params.id, tenantId: req.tenantId }
-        : { _id: req.params.id, tenantId: req.tenantId };
+        : { _id: mongoose.Types.ObjectId.isValid(req.params.id) ? req.params.id : null, tenantId: req.tenantId };
+
+    if (!isRef && !ccQuery._id) return res.status(404).json({ message: 'Not found' });
 
     const ccTransaction = await CreditCardTransaction.findOne(ccQuery);
     
