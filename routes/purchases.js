@@ -48,7 +48,6 @@ const applyPurchaseToProducts = async (purchaseOrder) => {
   }
 };
 
-// Helper function to reverse stock and cost changes
 const reversePurchaseFromProducts = async (purchaseOrder) => {
   const totalItemCost = purchaseOrder.items.reduce(
     (sum, item) => sum + item.unitCost * item.quantity,
@@ -88,13 +87,12 @@ const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymen
   const { paymentDetails, tenantId, totalCost, supplierInfo, id } = purchaseOrder;
   const descriptionBase = `Compra #${id} - ${supplierInfo.name}`;
 
-  // 1. Credit Card Logic
+  // 1. Credit Card Logic (Generates CreditCardTransaction)
   if (paymentDetails.financialAccountId && paymentDetails.financialAccountId !== 'cash-box' && paymentDetails.financialAccountId !== 'boleto' && paymentDetails.paymentMethodId) {
       const account = await FinancialAccount.findOne({ _id: paymentDetails.financialAccountId, tenantId });
       const methodRule = account?.paymentMethods.find(m => m.id === paymentDetails.paymentMethodId || (m._id && m._id.toString() === paymentDetails.paymentMethodId));
 
       if (methodRule && methodRule.type === 'Credit') {
-          // Determine number of installments: prefer 'installmentCount' field, fallback to array length, default to 1.
           let numInstallments = 1;
           if (paymentDetails.installmentCount && paymentDetails.installmentCount > 0) {
               numInstallments = paymentDetails.installmentCount;
@@ -105,10 +103,7 @@ const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymen
           const installmentValue = totalCost / numInstallments;
           const closingDay = methodRule.closingDay || 1;
           const dueDay = methodRule.dueDay || 10;
-          
-          // Use the provided Payment Date (Transaction Date) as the competence date, or fallback to creation date
           const competenceDate = reqPaymentDate ? new Date(reqPaymentDate) : new Date(purchaseOrder.createdAt);
-          
           const pDay = competenceDate.getDate();
           let targetMonth = competenceDate.getMonth();
           let targetYear = competenceDate.getFullYear();
@@ -144,19 +139,16 @@ const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymen
                   referenceId: id
               });
           }
-          
           await CreditCardTransaction.insertMany(ccTransactions);
-          
-          // Sync Invoices
           for (const dateStr of affectedDueDates) {
                 await syncInvoiceRecord(tenantId, paymentDetails.financialAccountId, paymentDetails.paymentMethodId, new Date(dateStr));
           }
-          return; // Done
+          return;
       }
   }
 
-  // 2. Split Payment Logic (Boleto or Manual Installments via Cash)
-  // If payment method is Boleto AND there are multiple installments defined
+  // 2. Boleto / Manual Split Logic -> Generates MULTIPLE CashTransactions (Individual Control)
+  // This satisfies the requirement: "Pagamento do boleto seja feito no caixa individualmente"
   if (paymentDetails.method === PaymentMethod.BANK_SLIP && Array.isArray(paymentDetails.installments) && paymentDetails.installments.length > 0) {
         const transactionsToAdd = paymentDetails.installments.map((inst) => ({
             tenantId,
@@ -164,11 +156,11 @@ const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymen
             amount: inst.amount,
             type: TransactionType.EXPENSE,
             category: TransactionCategory.PRODUCT_PURCHASE,
-            status: TransactionStatus.PENDING, // Always pending initially for Boletos
+            status: TransactionStatus.PENDING,
             timestamp: new Date(purchaseOrder.createdAt),
             dueDate: new Date(inst.dueDate),
-            purchaseId: id,
-            financialAccountId: 'boleto', // Logic marker, creates cash transaction
+            purchaseId: id, // Link to Parent
+            financialAccountId: 'boleto',
             paymentMethodId: undefined
         }));
         
@@ -176,13 +168,10 @@ const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymen
         return;
   }
 
-  // 3. Default / Single Cash Transaction Logic (Immediate Payment or Single Future Payment)
-  const transactionsToAdd = [];
-  // Determine Status: If passed explicitly use it, otherwise infer
+  // 3. Single Cash Transaction (Cash/Pix/Debit)
   const finalStatus = reqStatus || (paymentDetails.method === PaymentMethod.BANK_SLIP ? TransactionStatus.PENDING : TransactionStatus.PAID);
   
-  // Logic for immediate payment or single manual entry
-  transactionsToAdd.push({
+  await CashTransaction.create({
     tenantId,
     description: descriptionBase,
     amount: totalCost,
@@ -192,17 +181,11 @@ const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymen
     timestamp: reqPaymentDate ? new Date(reqPaymentDate) : (paymentDetails.paymentDate || new Date()),
     dueDate: reqDueDate ? new Date(reqDueDate) : (paymentDetails.paymentDate || new Date()),
     paymentDate: finalStatus === TransactionStatus.PAID ? (reqPaymentDate ? new Date(reqPaymentDate) : (paymentDetails.paymentDate || new Date())) : undefined,
-    purchaseId: id,
+    purchaseId: id, // Link to Parent
     financialAccountId: paymentDetails.financialAccountId === 'boleto' ? undefined : (paymentDetails.financialAccountId || 'cash-box'),
     paymentMethodId: paymentDetails.paymentMethodId
   });
-  
-  if (transactionsToAdd.length > 0) {
-      await CashTransaction.insertMany(transactionsToAdd);
-  }
 };
-
-// ... [GET / and POST / endpoints similar, just ensuring createTransactionsForPurchase is called] ...
 
 router.get('/', protect, authorize('owner', 'manager'), async (req, res) => {
   try {
@@ -257,8 +240,6 @@ router.post('/', protect, authorize('owner', 'manager'), async (req, res) => {
   }
 });
 
-// ... [PUT /:id and DELETE /:id logic needs to handle CreditCardTransaction cleanup] ...
-
 router.delete('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
     try {
       const poToDelete = await PurchaseOrder.findOne({ _id: req.params.id, tenantId: req.tenantId });
@@ -266,18 +247,16 @@ router.delete('/:id', protect, authorize('owner', 'manager'), async (req, res) =
 
       await reversePurchaseFromProducts(poToDelete);
       
-      // Cleanup CashTransactions
+      // Cleanup CashTransactions (Individual records linked by purchaseId)
       await CashTransaction.deleteMany({ purchaseId: poToDelete.id, tenantId: req.tenantId });
       
       // Cleanup CreditCardTransactions
-      // First find them to know which invoices to sync
       const ccTrans = await CreditCardTransaction.find({ referenceId: poToDelete.id, tenantId: req.tenantId, source: 'purchase' });
       const affectedInvoices = new Set();
       ccTrans.forEach(t => affectedInvoices.add(JSON.stringify({ acc: t.financialAccountId, met: t.paymentMethodId, due: t.dueDate })));
       
       await CreditCardTransaction.deleteMany({ referenceId: poToDelete.id, tenantId: req.tenantId, source: 'purchase' });
       
-      // Sync affected invoices
       for (const invStr of affectedInvoices) {
           const inv = JSON.parse(invStr);
           await syncInvoiceRecord(req.tenantId, inv.acc, inv.met, new Date(inv.due));
@@ -291,24 +270,20 @@ router.delete('/:id', protect, authorize('owner', 'manager'), async (req, res) =
   }
 );
 
-// PUT is complex, simplified to reverse -> create new for financial consistency
 router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
-    // ... [Implementation would mirror DELETE then POST logic for financials] ...
-    // For brevity in this fix, assuming similar structure to original but calling new helpers
-    // Not implementing full PUT body here to save space, but logic is: Reverse stock/finance -> Apply new stock/finance.
     try {
         const originalPO = await PurchaseOrder.findOne({ _id: req.params.id, tenantId: req.tenantId });
         if (!originalPO) return res.status(404).json({ message: 'Not found' });
 
-        // 1. Reverse
+        // 1. Reverse Old
         await reversePurchaseFromProducts(originalPO);
         await CashTransaction.deleteMany({ purchaseId: originalPO.id, tenantId: req.tenantId });
         
-        // CC Cleanup
-        const ccTrans = await CreditCardTransaction.find({ referenceId: originalPO.id, tenantId: req.tenantId });
+        const ccTrans = await CreditCardTransaction.find({ referenceId: originalPO.id, tenantId: req.tenantId, source: 'purchase' });
         const affectedInvoices = new Set();
         ccTrans.forEach(t => affectedInvoices.add(JSON.stringify({ acc: t.financialAccountId, met: t.paymentMethodId, due: t.dueDate })));
-        await CreditCardTransaction.deleteMany({ referenceId: originalPO.id, tenantId: req.tenantId });
+        await CreditCardTransaction.deleteMany({ referenceId: originalPO.id, tenantId: req.tenantId, source: 'purchase' });
+        
         for (const invStr of affectedInvoices) {
             const inv = JSON.parse(invStr);
             await syncInvoiceRecord(req.tenantId, inv.acc, inv.met, new Date(inv.due));
@@ -330,4 +305,3 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
 });
 
 export default router;
-
