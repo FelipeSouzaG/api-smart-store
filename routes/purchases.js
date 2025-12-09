@@ -87,7 +87,7 @@ const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymen
   const { paymentDetails, tenantId, totalCost, supplierInfo, id } = purchaseOrder;
   const descriptionBase = `Compra #${id} - ${supplierInfo.name}`;
 
-  // 1. Credit Card Logic (Generates CreditCardTransaction)
+  // 1. Credit Card Logic (Generates CreditCardTransaction in Statement)
   if (paymentDetails.financialAccountId && paymentDetails.financialAccountId !== 'cash-box' && paymentDetails.financialAccountId !== 'boleto' && paymentDetails.paymentMethodId) {
       const account = await FinancialAccount.findOne({ _id: paymentDetails.financialAccountId, tenantId });
       const methodRule = account?.paymentMethods.find(m => m.id === paymentDetails.paymentMethodId || (m._id && m._id.toString() === paymentDetails.paymentMethodId));
@@ -104,9 +104,9 @@ const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymen
           const closingDay = methodRule.closingDay || 1;
           const dueDay = methodRule.dueDay || 10;
           const competenceDate = reqPaymentDate ? new Date(reqPaymentDate) : new Date(purchaseOrder.createdAt);
-          const pDay = competenceDate.getDate();
-          let targetMonth = competenceDate.getMonth();
-          let targetYear = competenceDate.getFullYear();
+          const pDay = competenceDate.getUTCDate();
+          let targetMonth = competenceDate.getUTCMonth();
+          let targetYear = competenceDate.getUTCFullYear();
 
           if (pDay >= closingDay) {
               targetMonth += 1;
@@ -147,24 +147,33 @@ const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymen
       }
   }
 
-  // 2. Boleto / Manual Split Logic -> Generates MULTIPLE CashTransactions (Individual Control)
-  // This satisfies the requirement: "Pagamento do boleto seja feito no caixa individualmente"
+  // 2. Boleto / Manual Split Logic -> Generates SINGLE CashTransaction Parent with Installments Array
+  // This matches the logic in 'transactions.js' for manual costs
   if (paymentDetails.method === PaymentMethod.BANK_SLIP && Array.isArray(paymentDetails.installments) && paymentDetails.installments.length > 0) {
-        const transactionsToAdd = paymentDetails.installments.map((inst) => ({
-            tenantId,
-            description: `${descriptionBase} (${inst.installmentNumber}/${paymentDetails.installments.length})`,
+        
+        const installmentsArray = paymentDetails.installments.map(inst => ({
+            number: inst.installmentNumber,
             amount: inst.amount,
+            dueDate: new Date(inst.dueDate),
+            status: TransactionStatus.PENDING,
+            paymentDate: null
+        }));
+
+        await CashTransaction.create({
+            tenantId,
+            description: descriptionBase,
+            amount: totalCost,
             type: TransactionType.EXPENSE,
             category: TransactionCategory.PRODUCT_PURCHASE,
             status: TransactionStatus.PENDING,
             timestamp: new Date(purchaseOrder.createdAt),
-            dueDate: new Date(inst.dueDate),
+            dueDate: reqDueDate ? new Date(reqDueDate) : new Date(paymentDetails.installments[0].dueDate), // First due date as base
             purchaseId: id, // Link to Parent
             financialAccountId: 'boleto',
-            paymentMethodId: undefined
-        }));
+            paymentMethodId: undefined,
+            installments: installmentsArray // Array of sub-records
+        });
         
-        await CashTransaction.insertMany(transactionsToAdd);
         return;
   }
 
@@ -179,7 +188,10 @@ const createTransactionsForPurchase = async (purchaseOrder, reqStatus, reqPaymen
     category: TransactionCategory.PRODUCT_PURCHASE,
     status: finalStatus,
     timestamp: reqPaymentDate ? new Date(reqPaymentDate) : (paymentDetails.paymentDate || new Date()),
-    dueDate: reqDueDate ? new Date(reqDueDate) : (paymentDetails.paymentDate || new Date()),
+    // Ensure dueDate is set. If paid, dueDate = paymentDate.
+    dueDate: finalStatus === TransactionStatus.PAID 
+        ? (reqPaymentDate ? new Date(reqPaymentDate) : new Date())
+        : (reqDueDate ? new Date(reqDueDate) : new Date()),
     paymentDate: finalStatus === TransactionStatus.PAID ? (reqPaymentDate ? new Date(reqPaymentDate) : (paymentDetails.paymentDate || new Date())) : undefined,
     purchaseId: id, // Link to Parent
     financialAccountId: paymentDetails.financialAccountId === 'boleto' ? undefined : (paymentDetails.financialAccountId || 'cash-box'),
