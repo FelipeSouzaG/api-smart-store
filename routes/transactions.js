@@ -243,6 +243,13 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
     if (existingCash) {
          if(existingCash.isInvoice) return res.status(403).json({ message: "Edite as compras individuais da fatura." });
          
+         // Logic to Handle Transition from Split (Pending Boleto) to Single (Paid Cash)
+         // If installments (input) is 1 or missing, and we are updating status, wipe the array.
+         const inputInstallments = parseInt(installments || '1');
+         if (inputInstallments === 1 && existingCash.installments && existingCash.installments.length > 0) {
+             existingCash.installments = []; // Clear sub-installments to make it a single record
+         }
+
          // Simple Status/Date Update
          existingCash.status = status || existingCash.status;
          if (existingCash.status === TransactionStatus.PAID) {
@@ -251,9 +258,17 @@ router.put('/:id', protect, authorize('owner', 'manager'), async (req, res) => {
              existingCash.paymentDate = undefined;
          }
          
+         // Robust Due Date Handling
+         if (req.body.dueDate) {
+             existingCash.dueDate = new Date(req.body.dueDate);
+         } else if (existingCash.status === TransactionStatus.PAID && otherData.paymentDate) {
+             // Fallback: If paid, dueDate matches payment date to prevent validation errors
+             existingCash.dueDate = new Date(otherData.paymentDate);
+         }
+         
          if (description) existingCash.description = description;
          if (amount) existingCash.amount = amount;
-         if (dueDate) existingCash.dueDate = new Date(dueDate);
+         if (financialAccountId) existingCash.financialAccountId = financialAccountId; // Ensure account updates too
 
          await existingCash.save();
 
