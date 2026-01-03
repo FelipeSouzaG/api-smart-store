@@ -1,11 +1,11 @@
 {
   "name": "smart-store-backend",
   "version": "1.0.0",
-  "description": "Backend for Smart Store Management App",
+  "description": "Backend for Smart Store",
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "dev": "node server.js",
+    "dev": "nodemon server.js",
     "start": "node server.js",
     "build": "echo 'No build step required'"
   },
@@ -21,6 +21,8 @@
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.4.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
   }
 }
-
