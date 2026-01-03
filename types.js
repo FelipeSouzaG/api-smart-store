@@ -1,5 +1,3 @@
-// This file provides JavaScript-compatible enums for the backend.
-
 export const UserRole = {
   OWNER: 'owner',
   MANAGER: 'manager',
