@@ -1,4 +1,3 @@
-
 import 'dotenv/config';
 import express from 'express';
 import mongoose from 'mongoose';
@@ -20,62 +19,43 @@ import usersRouter from './routes/users.js';
 import customersRouter from './routes/customers.js';
 import suppliersRouter from './routes/suppliers.js';
 import settingsRouter from './routes/settings.js';
-import financialRouter from './routes/financial.js';
-
-// Validação de Variáveis Críticas
-const requiredEnvVars = [
-  'JWT_SECRET',
-  'MONGODB_URI',
-  'SAAS_API_URL'
-];
-
-if (process.env.NODE_ENV === 'production') {
-  const missingVars = requiredEnvVars.filter(key => !process.env[key]);
-  if (missingVars.length > 0) {
-    console.error('FATAL ERROR: Missing required environment variables:', missingVars.join(', '));
-    process.exit(1);
-  }
-}
+import storefrontRouter from './routes/storefront.js';
+import ecommerceOrdersRouter from './routes/ecommerceOrders.js';
+import systemRouter from './routes/system.js';
+import subscriptionRouter from './routes/subscription.js';
 
 const app = express();
 const PORT = process.env.PORT || 4001;
 
-// Configuração para Proxy Reverso (Render, Nginx)
-// Essencial para Rate Limit e Cookies seguros em produção
 app.set('trust proxy', 1);
 
 app.use(helmet());
 app.use(cookieParser());
 
-// CORS Configuration
-const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
-  : [
-      process.env.FLUXOCLEAN, 
-      process.env.SMARTSTORE,
-      'http://localhost:3000', 
-      'http://localhost:3001'
-    ].filter(Boolean);
-
 app.use(
   cors({
     origin: function (origin, callback) {
-      if (!origin) return callback(null, true);
-      
-      if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV !== 'production') {
-        return callback(null, true);
+      const allowedOrigins = process.env.ALLOWED_ORIGINS
+        ? process.env.ALLOWED_ORIGINS.split(',')
+        : [];
+
+      if (
+        !origin ||
+        allowedOrigins.indexOf(origin) !== -1 ||
+        origin.endsWith('.fluxoclean.com.br') ||
+        origin.includes('localhost')
+      ) {
+        callback(null, true);
       } else {
-        console.warn(`BLOCKED CORS: Origin ${origin} is not allowed.`);
-        return callback(new Error('Not allowed by CORS'), false);
+        callback(new Error('Not allowed by CORS'));
       }
     },
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   })
 );
 
-app.use(express.json({ limit: '10kb' }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(mongoSanitize());
 
 const limiter = rateLimit({
@@ -84,19 +64,23 @@ const limiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: 'Muitas requisições deste IP, tente novamente mais tarde.',
-  keyGenerator: (req) => {
-    return req.ip || req.headers['x-forwarded-for'] || 'unknown';
-  }
 });
 app.use('/api', limiter);
+
+const storefrontLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 const connectDB = async () => {
   if (!process.env.MONGODB_URI) return;
   try {
     await mongoose.connect(process.env.MONGODB_URI);
-    console.log('✅ Conectado ao banco SmartStore');
+    console.log('Banco Mongo Smart Store Conectado');
   } catch (err) {
-    console.error('❌ MongoDB connection error:', err);
+    console.error('MongoDB connection error:', err);
   }
 };
 connectDB();
@@ -105,6 +89,7 @@ app.get('/', (req, res) => {
   res.send('Smart Store API Running');
 });
 
+// Rotas Privadas (Dashboard)
 app.use('/api/auth', authRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/products', productsRouter);
@@ -117,7 +102,12 @@ app.use('/api/insights', insightsRouter);
 app.use('/api/customers', customersRouter);
 app.use('/api/suppliers', suppliersRouter);
 app.use('/api/settings', settingsRouter);
-app.use('/api/financial', financialRouter);
+app.use('/api/ecommerce-orders', ecommerceOrdersRouter);
+app.use('/api/system', systemRouter);
+app.use('/api/subscription', subscriptionRouter);
+
+// Rotas Públicas (E-commerce)
+app.use('/api/storefront', storefrontLimiter, storefrontRouter);
 
 app.use((req, res, next) => {
   res.status(404).json({ message: 'Rota não encontrada.' });
@@ -129,5 +119,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor SmartStore rodando na porta ${PORT}`);
+  console.log(`Servidor Smart-Store Online na porta ${PORT}`);
 });
